@@ -2,6 +2,7 @@ package com.bim.sunlevel;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.pm.PackageManager;
@@ -28,11 +29,13 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
 import android.provider.MediaStore;
+import android.text.InputType;
 import android.view.Gravity;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.Toast;
@@ -63,18 +66,20 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private boolean gpsLocked = false;
 
     // Ориентация камеры для AR (в градусах)
-    private float camAzimuth = 0f;   // 0..360 (0=С, 90=В, 180=Ю, 270=З)
-    private float camAltitude = 0f;  // -90..+90 (0=горизонт, +90=зенит)
+    private float camAzimuth = 0f;
+    private float camAltitude = 0f;
     private float camRoll = 0f;
 
-    // Данные для цифрового нивелира (с учетом калибровки "Тара")
+    // Данные для цифрового нивелира
     private float rawPitch = 0f, rawRoll = 0f;
     private float tarePitch = 0f, tareRoll = 0f;
 
-    // Барометр и люксметр
+    // Барометр, калибровка этажа и люксметр
     private float currentPressure = 1013.25f;
     private float basePressure = -1f;
-    private float relativeHeightMeters = 0f;
+    private float floorHeightMeters = 3.0f;      // Стандартный шаг этажа 3.0 м
+    private float calibratedBaseHeight = 12.0f;  // По умолчанию старт на 5 этаже (+12.00 м)
+    private float relativeHeightMeters = 12.0f;
     private float currentLux = 0f;
 
     // Режимы отображения даты солнца
@@ -102,7 +107,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         overlayView = new AROverlayView(this);
         root.addView(overlayView);
 
-        // Нижняя панель кнопок управления (5 кнопок)
+        // Нижняя панель кнопок управления
         LinearLayout bottomBar = new LinearLayout(this);
         bottomBar.setOrientation(LinearLayout.HORIZONTAL);
         bottomBar.setGravity(Gravity.CENTER);
@@ -119,11 +124,8 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             Toast.makeText(this, "Уклономер обнулен (0.0°)", Toast.LENGTH_SHORT).show();
         });
 
-        Button btnZeroAlt = createButton("Отм 0м", Color.argb(210, 45, 65, 95));
-        btnZeroAlt.setOnClickListener(v -> {
-            basePressure = currentPressure;
-            Toast.makeText(this, "Базовая отметка 0.00 м зафиксирована", Toast.LENGTH_SHORT).show();
-        });
+        Button btnZeroAlt = createButton("Этаж/0м", Color.argb(210, 45, 65, 95));
+        btnZeroAlt.setOnClickListener(v -> showAltitudeCalibrationDialog());
 
         Button btnPhoto = createButton("Фото AR", Color.argb(230, 190, 75, 25));
         btnPhoto.setOnClickListener(v -> captureARPhoto());
@@ -170,7 +172,50 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         return b;
     }
 
-    // Захват кадра с камеры, наложение AR-слоя со штампом и сохранение в Галерею
+    // Диалог быстрой привязки текущего этажа и отметки
+    private void showAltitudeCalibrationDialog() {
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(50, 30, 50, 10);
+
+        final EditText inputFloor = new EditText(this);
+        inputFloor.setHint("Номер текущего этажа (например, 5)");
+        inputFloor.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_SIGNED);
+        int currentEstFloor = Math.round(relativeHeightMeters / floorHeightMeters) + 1;
+        inputFloor.setText(String.valueOf(currentEstFloor));
+        layout.addView(inputFloor);
+
+        final EditText inputStep = new EditText(this);
+        inputStep.setHint("Высота этажа в метрах (например, 3.0)");
+        inputStep.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        inputStep.setText(String.format(Locale.US, "%.1f", floorHeightMeters));
+        layout.addView(inputStep);
+
+        new AlertDialog.Builder(this)
+                .setTitle("Привязка высотной отметки")
+                .setMessage("Укажите этаж, на котором вы сейчас находитесь:")
+                .setView(layout)
+                .setPositiveButton("Привязать этаж", (dialog, which) -> {
+                    try {
+                        int fl = Integer.parseInt(inputFloor.getText().toString().trim());
+                        float step = Float.parseFloat(inputStep.getText().toString().trim());
+                        if (step > 1.0f) floorHeightMeters = step;
+                        basePressure = currentPressure;
+                        calibratedBaseHeight = (fl - 1) * floorHeightMeters;
+                        Toast.makeText(this, String.format(Locale.US,
+                                "Привязан %d этаж (Отметка %+.2f м)", fl, calibratedBaseHeight),
+                                Toast.LENGTH_SHORT).show();
+                    } catch (Exception ignored) {}
+                })
+                .setNeutralButton("Сброс в 0.00 м (1 эт)", (dialog, which) -> {
+                    basePressure = currentPressure;
+                    calibratedBaseHeight = 0f;
+                    Toast.makeText(this, "Отметка обнулена: 0.00 м (1 этаж)", Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("Отмена", null)
+                .show();
+    }
+
     private void captureARPhoto() {
         if (camera == null) {
             Toast.makeText(this, "Камера не активна", Toast.LENGTH_SHORT).show();
@@ -182,14 +227,12 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                     Camera.Parameters params = cam.getParameters();
                     Camera.Size prevSize = params.getPreviewSize();
 
-                    // Конвертация буфера камеры NV21 в JPEG
                     YuvImage yuvImage = new YuvImage(data, ImageFormat.NV21, prevSize.width, prevSize.height, null);
                     ByteArrayOutputStream baos = new ByteArrayOutputStream();
                     yuvImage.compressToJpeg(new Rect(0, 0, prevSize.width, prevSize.height), 95, baos);
                     byte[] jpegBytes = baos.toByteArray();
                     Bitmap rawCamBitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.length);
 
-                    // Поворот кадра на 90 градусов для портретного режима
                     Matrix matrix = new Matrix();
                     matrix.postRotate(90);
                     Bitmap rotatedCamBitmap = Bitmap.createBitmap(
@@ -202,15 +245,12 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                     Bitmap combinedBitmap = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888);
                     Canvas comboCanvas = new Canvas(combinedBitmap);
 
-                    // 1. Отрисовка кадра с камеры на весь холст
                     Rect destRect = new Rect(0, 0, targetW, targetH);
                     comboCanvas.drawBitmap(rotatedCamBitmap, null, destRect, null);
                     rotatedCamBitmap.recycle();
 
-                    // 2. Отрисовка AR-слоя (дуги солнца, нивелир, панель телеметрии)
                     overlayView.draw(comboCanvas);
 
-                    // 3. Добавление нижнего штампа времени фотофиксации
                     Paint stampPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
                     stampPaint.setColor(Color.argb(200, 15, 20, 28));
                     comboCanvas.drawRoundRect(new RectF(20, targetH - 180, targetW - 20, targetH - 110), 16f, 16f, stampPaint);
@@ -220,7 +260,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                     String timeStamp = new SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.US).format(new Date());
                     comboCanvas.drawText("ШТАМП ФИКСАЦИИ: " + timeStamp, 45, targetH - 135, stampPaint);
 
-                    // 4. Запись в системную Галерею (Pictures/BIM_SunLevel)
                     String fileName = "BIM_AR_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date()) + ".jpg";
                     ContentValues values = new ContentValues();
                     values.put(MediaStore.Images.Media.DISPLAY_NAME, fileName);
@@ -349,9 +388,12 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             rawRoll = rawRoll + 0.12f * (rollDeg - rawRoll);
 
         } else if (type == Sensor.TYPE_PRESSURE) {
-            currentPressure = event.values[0];
+            // Плавная фильтрация микроколебаний барометра
+            currentPressure = (basePressure < 0) ? event.values[0] : (currentPressure + 0.15f * (event.values[0] - currentPressure));
             if (basePressure < 0) basePressure = currentPressure;
-            relativeHeightMeters = 44330f * (1f - (float) Math.pow(currentPressure / basePressure, 0.190295f));
+
+            float deltaFromBase = 44330f * (1f - (float) Math.pow(currentPressure / basePressure, 0.190295f));
+            relativeHeightMeters = calibratedBaseHeight + deltaFromBase;
 
         } else if (type == Sensor.TYPE_LIGHT) {
             currentLux = event.values[0];
@@ -407,7 +449,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             String ts = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date());
             float calPitch = rawPitch - tarePitch;
             float mmPerMeter = (float) (Math.tan(Math.toRadians(Math.abs(calPitch))) * 1000.0);
-            int estFloor = Math.round(relativeHeightMeters / 3.0f) + 1;
+            int estFloor = Math.round(relativeHeightMeters / floorHeightMeters) + 1;
 
             fw.append(String.format(Locale.US, "%s,%.5f,%.5f,%.1f,%.1f,%.2f,%.1f,%.0f,%.2f,%d\n",
                     ts, latitude, longitude, camAzimuth, camAltitude, calPitch, mmPerMeter,
@@ -447,7 +489,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         } catch (Exception ignored) {}
     }
 
-    // Кастомный слой AR-графики и цифрового нивелира
     private class AROverlayView extends View {
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Path path = new Path();
@@ -482,12 +523,12 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 }
             }
 
-            // 2. Дуги Солнца (Зима, Лето и выбранная дата)
+            // 2. Дуги Солнца
             drawSunArc(canvas, w, h, fovH, fovV, 355, Color.argb(140, 100, 180, 255), false);
             drawSunArc(canvas, w, h, fovH, fovV, 172, Color.argb(140, 255, 120, 80), false);
             drawSunArc(canvas, w, h, fovH, fovV, selectedDayOfYear, Color.rgb(255, 230, 0), true);
 
-            // 3. Цифровой 2D-нивелир (мишень в центре)
+            // 3. Цифровой 2D-нивелир
             float calPitch = rawPitch - tarePitch;
             float calRoll = rawRoll - tareRoll;
             float levelRadius = 110f;
@@ -520,9 +561,9 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             canvas.drawText(String.format(Locale.US, "Уклон: %.1f° | %.1f%% | %.0f мм/м (Крен: %.1f°)",
                     calPitch, slopePercent, slopeMmM, calRoll), 45, 135, paint);
 
-            int estFloor = Math.round(relativeHeightMeters / 3.0f) + 1;
+            int estFloor = Math.round(relativeHeightMeters / floorHeightMeters) + 1;
             paint.setColor(Color.rgb(130, 220, 255));
-            canvas.drawText(String.format(Locale.US, "Отметка ΔH: %+.2f м (~%d эт.) | %.1f гПа",
+            canvas.drawText(String.format(Locale.US, "Отметка H: %+.2f м (~%d эт.) | %.1f гПа",
                     relativeHeightMeters, estFloor, currentPressure), 45, 190, paint);
 
             paint.setColor(Color.rgb(200, 255, 160));
