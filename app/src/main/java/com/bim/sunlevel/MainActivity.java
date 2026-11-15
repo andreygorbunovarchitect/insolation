@@ -498,14 +498,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 camera.stopPreview();
                 camera.setDisplayOrientation(90);
                 camera.setPreviewDisplay(holder);
-
-                Camera.Parameters params = camera.getParameters();
-                if (params.getSupportedFlashModes() != null &&
-                    params.getSupportedFlashModes().contains(Camera.Parameters.FLASH_MODE_TORCH)) {
-                    params.setFlashMode(Camera.Parameters.FLASH_MODE_TORCH);
-                }
-                camera.setParameters(params);
-
+                // Фонарик удален, камера работает в штатном режиме
                 camera.startPreview();
             }
         } catch (Exception e) {
