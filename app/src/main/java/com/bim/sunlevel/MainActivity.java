@@ -55,6 +55,7 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
@@ -114,6 +115,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         float[] yMeters;
         float heightMeters;
         int levels;
+        String houseNumber;
     }
 
     private final List<OsmBuilding> osmBuildings = new ArrayList<>();
@@ -135,9 +137,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         int min = cal.get(Calendar.MINUTE);
         selectedSolarHour = Math.max(5.0, Math.min(21.0, hr + min / 60.0));
 
-        // Загружаем резервный макет квартала до прихода ответа от сервера OSM
-        loadFallbackBuildings();
-
         FrameLayout root = new FrameLayout(this);
 
         cameraSurface = new SurfaceView(this);
@@ -148,11 +147,12 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         overlayView.setOnTouchListener((v, event) -> {
             if (is2DMapMode && event.getAction() == MotionEvent.ACTION_DOWN) {
                 if (event.getY() > 420 && event.getY() < v.getHeight() - 260) {
-                    if (mapScalePixelsPerMeter < 2.0f) mapScalePixelsPerMeter = 2.6f;
-                    else if (mapScalePixelsPerMeter < 3.2f) mapScalePixelsPerMeter = 4.0f;
-                    else mapScalePixelsPerMeter = 1.4f;
+                    if (mapScalePixelsPerMeter < 1.6f) mapScalePixelsPerMeter = 2.2f;
+                    else if (mapScalePixelsPerMeter < 2.5f) mapScalePixelsPerMeter = 3.5f;
+                    else if (mapScalePixelsPerMeter < 4.0f) mapScalePixelsPerMeter = 5.0f;
+                    else mapScalePixelsPerMeter = 1.2f;
                     overlayView.invalidate();
-                    Toast.makeText(this, "Масштаб 2D-плана изменен", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, "Масштаб плана изменен", Toast.LENGTH_SHORT).show();
                 }
             }
             return false;
@@ -207,6 +207,9 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         btnModeToggle.setOnClickListener(v -> {
             is2DMapMode = !is2DMapMode;
             btnModeToggle.setText(is2DMapMode ? "Камера AR" : "2D План");
+            if (!realOsmLoaded && !isFetchingOsm) {
+                fetchOsmBuildings(latitude, longitude);
+            }
             overlayView.invalidate();
         });
 
@@ -261,32 +264,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         fetchOsmBuildings(latitude, longitude);
     }
 
-    // Резервный макет зданий на случай отсутствия интернета или ожидания ответа сервера
-    private void loadFallbackBuildings() {
-        synchronized (osmBuildings) {
-            osmBuildings.clear();
-            // 1. Наш дом (5 этажей, 15м)
-            osmBuildings.add(makeRectBuilding(-28f, -6f, 28f, 6f, 5));
-            // 2. Юго-западный соседний корпус (9 этажей, 27м)
-            osmBuildings.add(makeRectBuilding(-65f, -55f, -15f, -41f, 9));
-            // 3. Юго-восточный соседний дом (10 этажей, 30м)
-            osmBuildings.add(makeRectBuilding(18f, -70f, 32f, -22f, 10));
-            // 4. Северный дом во дворе (5 этажей, 15м)
-            osmBuildings.add(makeRectBuilding(-35f, 38f, 30f, 50f, 5));
-            // 5. Западная высотка (14 этажей, 42м)
-            osmBuildings.add(makeRectBuilding(-95f, -10f, -75f, 35f, 14));
-        }
-    }
-
-    private OsmBuilding makeRectBuilding(float x1, float y1, float x2, float y2, int levels) {
-        OsmBuilding b = new OsmBuilding();
-        b.xMeters = new float[]{x1, x2, x2, x1};
-        b.yMeters = new float[]{y1, y1, y2, y2};
-        b.levels = levels;
-        b.heightMeters = levels * 3.0f;
-        return b;
-    }
-
     private String formatSolarHour(double sh) {
         int h = (int) sh;
         int m = (int) Math.round((sh - h) * 60.0);
@@ -307,29 +284,29 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         return b;
     }
 
-    // Загрузка реальных зданий из OpenStreetMap через зеркала, работающие в РФ и с VPN
+    // Загрузка реальных зданий из OpenStreetMap без заголовка, вызывавшего HTTP 406
     private void fetchOsmBuildings(final double lat, final double lon) {
         if (isFetchingOsm) return;
 
         if (checkSelfPermission(Manifest.permission.INTERNET) != PackageManager.PERMISSION_GRANTED) {
-            osmStatus = "ОШИБКА: нет INTERNET в AndroidManifest! (показан демо-план)";
+            osmStatus = "Нет разрешения INTERNET в AndroidManifest";
             if (overlayView != null) overlayView.postInvalidate();
             return;
         }
 
         isFetchingOsm = true;
-        osmStatus = "Загрузка домов OSM...";
+        osmStatus = "Загрузка реальных домов из OSM...";
         if (overlayView != null) overlayView.postInvalidate();
 
         new Thread(() -> {
             String[] endpoints = new String[]{
-                    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
-                    "https://overpass.private.coffee/api/interpreter",
                     "https://overpass-api.de/api/interpreter",
-                    "https://lz4.overpass-api.de/api/interpreter"
+                    "https://lz4.overpass-api.de/api/interpreter",
+                    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+                    "https://overpass.private.coffee/api/interpreter"
             };
             String query = String.format(Locale.US,
-                    "[out:json][timeout:15];(way[\"building\"](around:250,%.5f,%.5f);relation[\"building\"](around:250,%.5f,%.5f););out body geom;",
+                    "[out:json][timeout:15];(way[\"building\"](around:260,%.5f,%.5f);relation[\"building\"](around:260,%.5f,%.5f););out body geom;",
                     lat, lon, lat, lon);
 
             boolean success = false;
@@ -338,18 +315,27 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             for (String endpoint : endpoints) {
                 HttpURLConnection conn = null;
                 try {
-                    String urlStr = endpoint + "?data=" + URLEncoder.encode(query, "UTF-8");
-                    URL url = new URL(urlStr);
+                    // Используем POST с универсальным Accept: */*, чтобы исключить ошибку HTTP 406
+                    URL url = new URL(endpoint);
                     conn = (HttpURLConnection) url.openConnection();
-                    conn.setRequestMethod("GET");
-                    conn.setConnectTimeout(7000);
-                    conn.setReadTimeout(10000);
-                    conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Android; SunLevelBIM/1.1)");
-                    conn.setRequestProperty("Accept", "application/json");
+                    conn.setRequestMethod("POST");
+                    conn.setDoOutput(true);
+                    conn.setConnectTimeout(8000);
+                    conn.setReadTimeout(12000);
+                    conn.setRequestProperty("User-Agent", "SunLevelBIM/1.2");
+                    conn.setRequestProperty("Accept", "*/*");
+                    conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
+
+                    String postBody = "data=" + URLEncoder.encode(query, "UTF-8");
+                    OutputStream os = conn.getOutputStream();
+                    os.write(postBody.getBytes(StandardCharsets.UTF_8));
+                    os.flush();
+                    os.close();
 
                     int code = conn.getResponseCode();
                     if (code == 200) {
-                        BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+                        BufferedReader reader = new BufferedReader(
+                                new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8));
                         StringBuilder sb = new StringBuilder();
                         String line;
                         while ((line = reader.readLine()) != null) {
@@ -365,14 +351,11 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                             success = true;
                             break;
                         } else {
-                            lastErr = "0 зданий в радиусе 250м";
+                            lastErr = "0 домов в радиусе 260м";
                         }
                     } else {
                         lastErr = "HTTP " + code;
                     }
-                } catch (SecurityException se) {
-                    lastErr = "Нет INTERNET в Manifest!";
-                    break;
                 } catch (Exception e) {
                     lastErr = e.getClass().getSimpleName();
                 } finally {
@@ -385,9 +368,9 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             runOnUiThread(() -> {
                 isFetchingOsm = false;
                 if (ok) {
-                    osmStatus = "Реальные дома OSM: " + osmBuildings.size() + " шт.";
+                    osmStatus = "Карта OSM: " + osmBuildings.size() + " реальных домов";
                 } else {
-                    osmStatus = "Демо-квартал (ошибка сети: " + errInfo + ")";
+                    osmStatus = "Ошибка OSM (" + errInfo + ") — нажмите Этаж/0м";
                 }
                 if (overlayView != null) overlayView.invalidate();
             });
@@ -405,10 +388,13 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
 
         for (int i = 0; i < elements.length(); i++) {
             JSONObject el = elements.getJSONObject(i);
-            int levels = 5;
+            int levels = -1;
             float height = -1f;
+            String houseNum = "";
+
             JSONObject tags = el.optJSONObject("tags");
             if (tags != null) {
+                houseNum = tags.optString("addr:housenumber", "").trim();
                 String lvlStr = tags.optString("building:levels", "");
                 if (!lvlStr.isEmpty()) {
                     try {
@@ -422,15 +408,19 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                     } catch (Exception ignored) {}
                 }
             }
+
+            // Если в OSM не указана этажность конкретного дома, берем 5 этажей по умолчанию
+            if (levels <= 0 && height > 2f) {
+                levels = Math.max(1, Math.round(height / 3.0f));
+            }
             if (levels <= 0) levels = 5;
             if (height <= 2f) height = levels * 3.0f;
 
             JSONArray geom = el.optJSONArray("geometry");
             if (geom != null && geom.length() >= 3) {
-                OsmBuilding b = buildFromGeomArray(geom, centerLat, centerLon, metersPerDegLat, metersPerDegLon, levels, height);
+                OsmBuilding b = buildFromGeomArray(geom, centerLat, centerLon, metersPerDegLat, metersPerDegLon, levels, height, houseNum);
                 if (b != null) parsed.add(b);
             } else {
-                // Поддержка сложных зданий (relation -> members -> outer)
                 JSONArray members = el.optJSONArray("members");
                 if (members != null) {
                     for (int m = 0; m < members.length(); m++) {
@@ -438,7 +428,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                         if ("outer".equals(mem.optString("role", "outer"))) {
                             JSONArray mGeom = mem.optJSONArray("geometry");
                             if (mGeom != null && mGeom.length() >= 3) {
-                                OsmBuilding b = buildFromGeomArray(mGeom, centerLat, centerLon, metersPerDegLat, metersPerDegLon, levels, height);
+                                OsmBuilding b = buildFromGeomArray(mGeom, centerLat, centerLon, metersPerDegLat, metersPerDegLon, levels, height, houseNum);
                                 if (b != null) parsed.add(b);
                             }
                         }
@@ -458,7 +448,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
 
     private OsmBuilding buildFromGeomArray(JSONArray geom, double centerLat, double centerLon,
                                            double metersPerDegLat, double metersPerDegLon,
-                                           int levels, float height) {
+                                           int levels, float height, String houseNum) {
         try {
             OsmBuilding b = new OsmBuilding();
             b.xMeters = new float[geom.length()];
@@ -472,6 +462,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             }
             b.levels = levels;
             b.heightMeters = height;
+            b.houseNumber = houseNum;
             return b;
         } catch (Exception e) {
             return null;
@@ -668,7 +659,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         gpsLocked = true;
         double distSq = Math.pow((latitude - lastOsmLat) * 111132.0, 2) +
                         Math.pow((longitude - lastOsmLon) * 65000.0, 2);
-        if (!realOsmLoaded || distSq > 3600.0) {
+        if (!realOsmLoaded || distSq > 2500.0) {
             fetchOsmBuildings(latitude, longitude);
         }
     }
@@ -783,7 +774,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                     float x1 = b.xMeters[i], y1 = b.yMeters[i];
                     float x2 = b.xMeters[(i + 1) % n], y2 = b.yMeters[(i + 1) % n];
                     float dist = intersectRayWithSegment((float) rayDirX, (float) rayDirY, x1, y1, x2, y2);
-                    if (dist > 2.0f && dist <= maxShadowDist) {
+                    if (dist > 3.0f && dist <= maxShadowDist) {
                         return true;
                     }
                 }
@@ -911,10 +902,10 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             paint.setStrokeWidth(1.5f);
             paint.setColor(Color.argb(70, 90, 140, 190));
             canvas.drawLine(0, cy, w, cy, paint);
-            canvas.drawLine(cx, 380, cx, h - 180, paint);
+            canvas.drawLine(cx, 390, cx, h - 180, paint);
 
             paint.setTextSize(22f);
-            for (int rMeters : new int[]{50, 100, 150}) {
+            for (int rMeters : new int[]{50, 100, 150, 200}) {
                 float rPx = rMeters * scale;
                 canvas.drawCircle(cx, cy, rPx, paint);
                 paint.setStyle(Paint.Style.FILL);
@@ -922,7 +913,16 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 paint.setStyle(Paint.Style.STROKE);
             }
 
+            // Подписи сторон света по краям 2D-генплана
             paint.setStyle(Paint.Style.FILL);
+            paint.setColor(Color.rgb(0, 230, 180));
+            paint.setTextSize(26f);
+            canvas.drawText("СЕВЕР (С)", cx - 60, 420, paint);
+            canvas.drawText("ЮГ (Ю)", cx - 45, h - 225, paint);
+            canvas.drawText("З", 20, cy - 10, paint);
+            canvas.drawText("В", w - 40, cy - 10, paint);
+
+            // Зеленый сектор взгляда камеры
             paint.setColor(Color.argb(45, 0, 255, 180));
             RectF fovRect = new RectF(cx - 120 * scale, cy - 120 * scale, cx + 120 * scale, cy + 120 * scale);
             float startAngle2D = camAzimuth - 90f - 30f;
@@ -970,8 +970,12 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                     }
                     path.close();
 
+                    boolean isUserInside = isPointInPolygon(0f, 0f, b.xMeters, b.yMeters);
+
                     paint.setStyle(Paint.Style.FILL);
-                    if (b.heightMeters > relativeHeightMeters + 1.0f) {
+                    if (isUserInside) {
+                        paint.setColor(Color.argb(220, 35, 115, 95));
+                    } else if (b.heightMeters > relativeHeightMeters + 1.0f) {
                         paint.setColor(Color.argb(215, 75, 100, 135));
                     } else {
                         paint.setColor(Color.argb(195, 45, 65, 90));
@@ -979,14 +983,18 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                     canvas.drawPath(path, paint);
 
                     paint.setStyle(Paint.Style.STROKE);
-                    paint.setStrokeWidth(2.5f);
-                    paint.setColor(Color.rgb(140, 195, 245));
+                    paint.setStrokeWidth(isUserInside ? 4f : 2.2f);
+                    paint.setColor(isUserInside ? Color.rgb(0, 255, 160) : Color.rgb(140, 195, 245));
                     canvas.drawPath(path, paint);
 
+                    // Подпись реального номера дома и этажности из OSM
                     paint.setStyle(Paint.Style.FILL);
                     paint.setColor(Color.WHITE);
-                    paint.setTextSize(20f);
-                    canvas.drawText(b.levels + "эт", (sumX / n) - 18f, (sumY / n) + 7f, paint);
+                    paint.setTextSize(19f);
+                    String label = (b.houseNumber != null && !b.houseNumber.isEmpty())
+                            ? (b.houseNumber + " (" + b.levels + "эт)")
+                            : (b.levels + "эт");
+                    canvas.drawText(label, (sumX / n) - 24f, (sumY / n) + 6f, paint);
                 }
             }
 
@@ -1014,7 +1022,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             paint.setTextSize(24f);
             String shadowStatus = (sunAlt <= 0) ? "Ночь (Солнце за горизонтом)" :
                     (inShadowNow ? "В ТЕНИ соседнего дома (на отм. этажа)" : "ПРЯМОЕ СОЛНЦЕ (тень мимо этажа)");
-            canvas.drawText(shadowStatus, 30, h - 195, paint);
+            canvas.drawText(shadowStatus, 30, h - 190, paint);
         }
 
         private void drawBuildingShadow(Canvas canvas, OsmBuilding b, float cx, float cy, float scale, float offX, float offY) {
