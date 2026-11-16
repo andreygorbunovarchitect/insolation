@@ -75,12 +75,13 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private Button btnModeToggle;
     private TextView timeLabelView;
 
-    // Стартовые координаты (по умолчанию 54.619 N, 39.742 E до уточнения GPS)
-    private double latitude = 54.6190;
+    // Стартовые координаты
+    private double latitude = 54.6195;
     private double longitude = 39.7420;
     private double lastOsmLat = 0.0;
     private double lastOsmLon = 0.0;
     private boolean gpsLocked = false;
+    private boolean realOsmLoaded = false;
 
     // Ориентация камеры (в градусах)
     private float camAzimuth = 0f;
@@ -102,16 +103,15 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     // Дата и выбранное ползунком время суток
     private int selectedDayOfYear = 80;
     private String selectedSeasonLabel = "21 Мар/Сен (СанПиН)";
-    private double selectedSolarHour = 12.5; // Ползунок времени (5.0 .. 21.0)
+    private double selectedSolarHour = 12.5;
 
     // Режим отображения: false = AR Камера, true = 2D Генплан с тенями
     private boolean is2DMapMode = false;
     private float mapScalePixelsPerMeter = 2.2f;
 
-    // Список зданий из OpenStreetMap
     private static class OsmBuilding {
-        float[] xMeters; // Восток (+X), Запад (-X) относительно пользователя
-        float[] yMeters; // Север (+Y), Юг (-Y) относительно пользователя
+        float[] xMeters;
+        float[] yMeters;
         float heightMeters;
         int levels;
     }
@@ -135,6 +135,9 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         int min = cal.get(Calendar.MINUTE);
         selectedSolarHour = Math.max(5.0, Math.min(21.0, hr + min / 60.0));
 
+        // Загружаем резервный макет квартала до прихода ответа от сервера OSM
+        loadFallbackBuildings();
+
         FrameLayout root = new FrameLayout(this);
 
         cameraSurface = new SurfaceView(this);
@@ -142,7 +145,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         root.addView(cameraSurface);
 
         overlayView = new AROverlayView(this);
-        // Масштабирование 2D-карты нажатием в режиме плана
         overlayView.setOnTouchListener((v, event) -> {
             if (is2DMapMode && event.getAction() == MotionEvent.ACTION_DOWN) {
                 if (event.getY() > 420 && event.getY() < v.getHeight() - 260) {
@@ -157,13 +159,11 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         });
         root.addView(overlayView);
 
-        // Нижний блок управления (ползунок времени + панель кнопок)
         LinearLayout bottomContainer = new LinearLayout(this);
         bottomContainer.setOrientation(LinearLayout.VERTICAL);
         bottomContainer.setBackgroundColor(Color.argb(205, 12, 18, 26));
         bottomContainer.setPadding(12, 10, 12, 20);
 
-        // Строка ползунка времени суток
         LinearLayout sliderRow = new LinearLayout(this);
         sliderRow.setOrientation(LinearLayout.HORIZONTAL);
         sliderRow.setGravity(Gravity.CENTER_VERTICAL);
@@ -176,7 +176,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         sliderRow.addView(timeLabelView);
 
         SeekBar timeSeekBar = new SeekBar(this);
-        timeSeekBar.setMax(160); // от 5.0 до 21.0 часов с шагом 0.1 ч (6 минут)
+        timeSeekBar.setMax(160);
         timeSeekBar.setProgress((int) Math.round((selectedSolarHour - 5.0) * 10.0));
         LinearLayout.LayoutParams seekParams = new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
@@ -199,7 +199,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         sliderRow.addView(timeSeekBar);
         bottomContainer.addView(sliderRow);
 
-        // Ряд кнопок управления
         LinearLayout bottomBar = new LinearLayout(this);
         bottomBar.setOrientation(LinearLayout.HORIZONTAL);
         bottomBar.setGravity(Gravity.CENTER);
@@ -259,8 +258,33 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
         requestPermissionsIfNeeded();
 
-        // Сразу запускаем загрузку домов OSM для текущих координат
         fetchOsmBuildings(latitude, longitude);
+    }
+
+    // Резервный макет зданий на случай отсутствия интернета или ожидания ответа сервера
+    private void loadFallbackBuildings() {
+        synchronized (osmBuildings) {
+            osmBuildings.clear();
+            // 1. Наш дом (5 этажей, 15м)
+            osmBuildings.add(makeRectBuilding(-28f, -6f, 28f, 6f, 5));
+            // 2. Юго-западный соседний корпус (9 этажей, 27м)
+            osmBuildings.add(makeRectBuilding(-65f, -55f, -15f, -41f, 9));
+            // 3. Юго-восточный соседний дом (10 этажей, 30м)
+            osmBuildings.add(makeRectBuilding(18f, -70f, 32f, -22f, 10));
+            // 4. Северный дом во дворе (5 этажей, 15м)
+            osmBuildings.add(makeRectBuilding(-35f, 38f, 30f, 50f, 5));
+            // 5. Западная высотка (14 этажей, 42м)
+            osmBuildings.add(makeRectBuilding(-95f, -10f, -75f, 35f, 14));
+        }
+    }
+
+    private OsmBuilding makeRectBuilding(float x1, float y1, float x2, float y2, int levels) {
+        OsmBuilding b = new OsmBuilding();
+        b.xMeters = new float[]{x1, x2, x2, x1};
+        b.yMeters = new float[]{y1, y1, y2, y2};
+        b.levels = levels;
+        b.heightMeters = levels * 3.0f;
+        return b;
     }
 
     private String formatSolarHour(double sh) {
@@ -283,35 +307,48 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         return b;
     }
 
-    // Загрузка реальных зданий из OpenStreetMap (Overpass API) в радиусе 220 метров
+    // Загрузка реальных зданий из OpenStreetMap через зеркала, работающие в РФ и с VPN
     private void fetchOsmBuildings(final double lat, final double lon) {
         if (isFetchingOsm) return;
+
+        if (checkSelfPermission(Manifest.permission.INTERNET) != PackageManager.PERMISSION_GRANTED) {
+            osmStatus = "ОШИБКА: нет INTERNET в AndroidManifest! (показан демо-план)";
+            if (overlayView != null) overlayView.postInvalidate();
+            return;
+        }
+
         isFetchingOsm = true;
         osmStatus = "Загрузка домов OSM...";
         if (overlayView != null) overlayView.postInvalidate();
 
         new Thread(() -> {
             String[] endpoints = new String[]{
+                    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+                    "https://overpass.private.coffee/api/interpreter",
                     "https://overpass-api.de/api/interpreter",
-                    "https://lz4.overpass-api.de/api/interpreter",
-                    "https://overpass.kumi.systems/api/interpreter"
+                    "https://lz4.overpass-api.de/api/interpreter"
             };
             String query = String.format(Locale.US,
-                    "[out:json][timeout:15];(way[\"building\"](around:220,%.5f,%.5f););out body geom;",
-                    lat, lon);
+                    "[out:json][timeout:15];(way[\"building\"](around:250,%.5f,%.5f);relation[\"building\"](around:250,%.5f,%.5f););out body geom;",
+                    lat, lon, lat, lon);
 
             boolean success = false;
+            String lastErr = "";
+
             for (String endpoint : endpoints) {
                 HttpURLConnection conn = null;
                 try {
                     String urlStr = endpoint + "?data=" + URLEncoder.encode(query, "UTF-8");
                     URL url = new URL(urlStr);
                     conn = (HttpURLConnection) url.openConnection();
-                    conn.setConnectTimeout(8000);
-                    conn.setReadTimeout(12000);
-                    conn.setRequestProperty("User-Agent", "SunLevelBIM-Android/1.0");
+                    conn.setRequestMethod("GET");
+                    conn.setConnectTimeout(7000);
+                    conn.setReadTimeout(10000);
+                    conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Android; SunLevelBIM/1.1)");
+                    conn.setRequestProperty("Accept", "application/json");
 
-                    if (conn.getResponseCode() == 200) {
+                    int code = conn.getResponseCode();
+                    if (code == 200) {
                         BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
                         StringBuilder sb = new StringBuilder();
                         String line;
@@ -320,35 +357,47 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                         }
                         reader.close();
 
-                        parseOsmJson(sb.toString(), lat, lon);
-                        lastOsmLat = lat;
-                        lastOsmLon = lon;
-                        success = true;
-                        break;
+                        int count = parseOsmJson(sb.toString(), lat, lon);
+                        if (count > 0) {
+                            lastOsmLat = lat;
+                            lastOsmLon = lon;
+                            realOsmLoaded = true;
+                            success = true;
+                            break;
+                        } else {
+                            lastErr = "0 зданий в радиусе 250м";
+                        }
+                    } else {
+                        lastErr = "HTTP " + code;
                     }
-                } catch (Exception ignored) {
+                } catch (SecurityException se) {
+                    lastErr = "Нет INTERNET в Manifest!";
+                    break;
+                } catch (Exception e) {
+                    lastErr = e.getClass().getSimpleName();
                 } finally {
                     if (conn != null) conn.disconnect();
                 }
             }
 
             final boolean ok = success;
+            final String errInfo = lastErr;
             runOnUiThread(() -> {
                 isFetchingOsm = false;
                 if (ok) {
-                    osmStatus = "Дома OSM: " + osmBuildings.size() + " шт.";
+                    osmStatus = "Реальные дома OSM: " + osmBuildings.size() + " шт.";
                 } else {
-                    osmStatus = "OSM нет связи (нажмите Этаж/0м для повтора)";
+                    osmStatus = "Демо-квартал (ошибка сети: " + errInfo + ")";
                 }
                 if (overlayView != null) overlayView.invalidate();
             });
         }).start();
     }
 
-    private void parseOsmJson(String jsonStr, double centerLat, double centerLon) throws Exception {
+    private int parseOsmJson(String jsonStr, double centerLat, double centerLon) throws Exception {
         JSONObject root = new JSONObject(jsonStr);
         JSONArray elements = root.optJSONArray("elements");
-        if (elements == null) return;
+        if (elements == null) return 0;
 
         List<OsmBuilding> parsed = new ArrayList<>();
         double metersPerDegLat = 111132.0;
@@ -356,22 +405,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
 
         for (int i = 0; i < elements.length(); i++) {
             JSONObject el = elements.getJSONObject(i);
-            JSONArray geom = el.optJSONArray("geometry");
-            if (geom == null || geom.length() < 3) continue;
-
-            OsmBuilding b = new OsmBuilding();
-            b.xMeters = new float[geom.length()];
-            b.yMeters = new float[geom.length()];
-
-            for (int j = 0; j < geom.length(); j++) {
-                JSONObject pt = geom.getJSONObject(j);
-                double ptLat = pt.getDouble("lat");
-                double ptLon = pt.getDouble("lon");
-                b.xMeters[j] = (float) ((ptLon - centerLon) * metersPerDegLon);
-                b.yMeters[j] = (float) ((ptLat - centerLat) * metersPerDegLat);
-            }
-
-            // Определение этажности и высоты здания из тегов OSM
             int levels = 5;
             float height = -1f;
             JSONObject tags = el.optJSONObject("tags");
@@ -392,14 +425,56 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             if (levels <= 0) levels = 5;
             if (height <= 2f) height = levels * 3.0f;
 
-            b.levels = levels;
-            b.heightMeters = height;
-            parsed.add(b);
+            JSONArray geom = el.optJSONArray("geometry");
+            if (geom != null && geom.length() >= 3) {
+                OsmBuilding b = buildFromGeomArray(geom, centerLat, centerLon, metersPerDegLat, metersPerDegLon, levels, height);
+                if (b != null) parsed.add(b);
+            } else {
+                // Поддержка сложных зданий (relation -> members -> outer)
+                JSONArray members = el.optJSONArray("members");
+                if (members != null) {
+                    for (int m = 0; m < members.length(); m++) {
+                        JSONObject mem = members.getJSONObject(m);
+                        if ("outer".equals(mem.optString("role", "outer"))) {
+                            JSONArray mGeom = mem.optJSONArray("geometry");
+                            if (mGeom != null && mGeom.length() >= 3) {
+                                OsmBuilding b = buildFromGeomArray(mGeom, centerLat, centerLon, metersPerDegLat, metersPerDegLon, levels, height);
+                                if (b != null) parsed.add(b);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        synchronized (osmBuildings) {
-            osmBuildings.clear();
-            osmBuildings.addAll(parsed);
+        if (!parsed.isEmpty()) {
+            synchronized (osmBuildings) {
+                osmBuildings.clear();
+                osmBuildings.addAll(parsed);
+            }
+        }
+        return parsed.size();
+    }
+
+    private OsmBuilding buildFromGeomArray(JSONArray geom, double centerLat, double centerLon,
+                                           double metersPerDegLat, double metersPerDegLon,
+                                           int levels, float height) {
+        try {
+            OsmBuilding b = new OsmBuilding();
+            b.xMeters = new float[geom.length()];
+            b.yMeters = new float[geom.length()];
+            for (int j = 0; j < geom.length(); j++) {
+                JSONObject pt = geom.getJSONObject(j);
+                double ptLat = pt.getDouble("lat");
+                double ptLon = pt.getDouble("lon");
+                b.xMeters[j] = (float) ((ptLon - centerLon) * metersPerDegLon);
+                b.yMeters[j] = (float) ((ptLat - centerLat) * metersPerDegLat);
+            }
+            b.levels = levels;
+            b.heightMeters = height;
+            return b;
+        } catch (Exception e) {
+            return null;
         }
     }
 
@@ -447,7 +522,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         int targetH = overlayView.getHeight();
         if (targetW <= 0 || targetH <= 0) return;
 
-        // Если включен 2D-генплан, сохраняем чертеж с тенями напрямую
         if (is2DMapMode || camera == null) {
             saveCombinedBitmapToGallery(null, targetW, targetH);
             return;
@@ -592,10 +666,9 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         latitude = loc.getLatitude();
         longitude = loc.getLongitude();
         gpsLocked = true;
-        // Если сместились более чем на 60 метров от точки прошлой выгрузки OSM — обновляем карту
         double distSq = Math.pow((latitude - lastOsmLat) * 111132.0, 2) +
                         Math.pow((longitude - lastOsmLon) * 65000.0, 2);
-        if (distSq > 3600.0) {
+        if (!realOsmLoaded || distSq > 3600.0) {
             fetchOsmBuildings(latitude, longitude);
         }
     }
@@ -671,7 +744,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     @Override
     public void onAccuracyChanged(Sensor sensor, int accuracy) {}
 
-    // Астрономический расчет Солнца: возвращает {Азимут 0..360, Высота над горизонтом -90..90}
     private double[] computeSunPosition(double latDeg, int dayOfYear, double solarHour) {
         double latRad = Math.toRadians(latDeg);
         double declDeg = 23.45 * Math.sin(Math.toRadians((360.0 / 365.0) * (284 + dayOfYear)));
@@ -692,19 +764,17 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         return new double[]{azDeg, Math.toDegrees(altRad)};
     }
 
-    // Проверка, закрыто ли Солнце соседними зданиями OSM на высоте текущего этажа
     private boolean isSunBlockedByOsmBuildings(double sunAzDeg, double sunAltDeg) {
-        if (sunAltDeg <= 0.5) return true;
-        double tanAlt = Math.tan(Math.toRadians(sunAltDeg));
+        if (sunAltDeg <= 0.0) return true;
+        double tanAlt = Math.tan(Math.toRadians(Math.max(0.2, sunAltDeg)));
         double rayDirX = Math.sin(Math.toRadians(sunAzDeg));
         double rayDirY = Math.cos(Math.toRadians(sunAzDeg));
 
         synchronized (osmBuildings) {
             for (OsmBuilding b : osmBuildings) {
                 float dh = b.heightMeters - relativeHeightMeters;
-                if (dh <= 0.5f) continue; // Здание ниже нашего этажа не дает тень на окно
+                if (dh <= 0.5f) continue;
 
-                // Если точка (0,0) внутри самого контура нашего дома — пропускаем его
                 if (isPointInPolygon(0f, 0f, b.xMeters, b.yMeters)) continue;
 
                 float maxShadowDist = (float) (dh / tanAlt);
@@ -734,7 +804,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         return inside;
     }
 
-    // Пересечение луча из (0,0) в направлении (dx, dy) с отрезком стены (x1,y1)-(x2,y2)
     private float intersectRayWithSegment(float dx, float dy, float x1, float y1, float x2, float y2) {
         float sx = x2 - x1;
         float sy = y2 - y1;
@@ -828,20 +897,16 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 drawARCameraOverlay(canvas, w, h);
             }
 
-            // Верхняя инженерная панель телеметрии (общая для AR и 2D-генплана)
             drawTelemetryHeader(canvas, w);
         }
 
-        // РЕЖИМ 1: 2D ГЕНПЛАН С ДОМАМИ OPENSTREETMAP И ТЕНЯМИ
         private void draw2DTopDownMap(Canvas canvas, int w, int h) {
-            // Темный чертежный фон генплана
             canvas.drawColor(Color.rgb(14, 22, 34));
 
             float cx = w / 2f;
             float cy = h * 0.56f;
             float scale = mapScalePixelsPerMeter;
 
-            // Координатная сетка и радиусы 50м / 100м / 150м
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeWidth(1.5f);
             paint.setColor(Color.argb(70, 90, 140, 190));
@@ -857,36 +922,31 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 paint.setStyle(Paint.Style.STROKE);
             }
 
-            // Сектор обзора камеры (куда сейчас направлен телефон)
             paint.setStyle(Paint.Style.FILL);
             paint.setColor(Color.argb(45, 0, 255, 180));
             RectF fovRect = new RectF(cx - 120 * scale, cy - 120 * scale, cx + 120 * scale, cy + 120 * scale);
             float startAngle2D = camAzimuth - 90f - 30f;
             canvas.drawArc(fovRect, startAngle2D, 60f, true, paint);
 
-            // Положение Солнца для выбранного на ползунке времени
             double[] sunPos = computeSunPosition(latitude, selectedDayOfYear, selectedSolarHour);
             double sunAz = sunPos[0];
             double sunAlt = sunPos[1];
 
-            // Вектор падения тени (противоположен азимуту Солнца)
             double shadowAzRad = Math.toRadians(sunAz + 180.0);
-            float shDirX = (float) Math.sin(shadowAzRad); // Восток (+X)
-            float shDirY = (float) Math.cos(shadowAzRad); // Север (+Y)
+            float shDirX = (float) Math.sin(shadowAzRad);
+            float shDirY = (float) Math.cos(shadowAzRad);
             double tanAlt = Math.max(0.08, Math.tan(Math.toRadians(Math.max(1.0, sunAlt))));
 
             synchronized (osmBuildings) {
-                // Слой 1: Тени зданий на уровне земли (темно-синие/черные)
                 if (sunAlt > 0.5) {
                     paint.setStyle(Paint.Style.FILL);
-                    paint.setColor(Color.argb(135, 4, 8, 15));
+                    paint.setColor(Color.argb(145, 4, 8, 15));
                     for (OsmBuilding b : osmBuildings) {
                         float shadowLen = Math.min(260f, (float) (b.heightMeters / tanAlt));
                         drawBuildingShadow(canvas, b, cx, cy, scale, shDirX * shadowLen, shDirY * shadowLen);
                     }
 
-                    // Слой 2: Тени зданий на высоте вашего этажа (фиолетово-синий контур)
-                    paint.setColor(Color.argb(115, 180, 70, 220));
+                    paint.setColor(Color.argb(120, 180, 70, 220));
                     for (OsmBuilding b : osmBuildings) {
                         float dh = b.heightMeters - relativeHeightMeters;
                         if (dh > 0.5f) {
@@ -896,7 +956,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                     }
                 }
 
-                // Слой 3: Контуры самих домов и подписи этажности
                 for (OsmBuilding b : osmBuildings) {
                     path.reset();
                     float sumX = 0f, sumY = 0f;
@@ -911,12 +970,11 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                     }
                     path.close();
 
-                    // Дома выше нашего этажа выделяем более теплым оттенком
                     paint.setStyle(Paint.Style.FILL);
                     if (b.heightMeters > relativeHeightMeters + 1.0f) {
-                        paint.setColor(Color.argb(210, 75, 95, 125));
+                        paint.setColor(Color.argb(215, 75, 100, 135));
                     } else {
-                        paint.setColor(Color.argb(190, 45, 65, 85));
+                        paint.setColor(Color.argb(195, 45, 65, 90));
                     }
                     canvas.drawPath(path, paint);
 
@@ -925,7 +983,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                     paint.setColor(Color.rgb(140, 195, 245));
                     canvas.drawPath(path, paint);
 
-                    // Подпись этажности в центре дома
                     paint.setStyle(Paint.Style.FILL);
                     paint.setColor(Color.WHITE);
                     paint.setTextSize(20f);
@@ -933,7 +990,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 }
             }
 
-            // Луч направления на Солнце на 2D-карте
             if (sunAlt > 0) {
                 float sunVecX = (float) Math.sin(Math.toRadians(sunAz));
                 float sunVecY = (float) Math.cos(Math.toRadians(sunAz));
@@ -949,21 +1005,18 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 canvas.drawCircle(sunScreenX, sunScreenY, 18f, paint);
             }
 
-            // Точка местоположения пользователя в центре
             boolean inShadowNow = isSunBlockedByOsmBuildings(sunAz, sunAlt);
             paint.setStyle(Paint.Style.FILL);
             paint.setColor(inShadowNow ? Color.rgb(255, 90, 90) : Color.rgb(0, 255, 140));
             canvas.drawCircle(cx, cy, 12f, paint);
 
-            // Подсказка внизу 2D-карты
             paint.setColor(Color.LTGRAY);
-            paint.setTextSize(25f);
+            paint.setTextSize(24f);
             String shadowStatus = (sunAlt <= 0) ? "Ночь (Солнце за горизонтом)" :
-                    (inShadowNow ? "В ТЕНИ соседнего здания (на отм. этажа)" : "ПРЯМОЕ СОЛНЦЕ (тень не перекрывает этаж)");
-            canvas.drawText(shadowStatus + " | " + osmStatus, 30, h - 195, paint);
+                    (inShadowNow ? "В ТЕНИ соседнего дома (на отм. этажа)" : "ПРЯМОЕ СОЛНЦЕ (тень мимо этажа)");
+            canvas.drawText(shadowStatus, 30, h - 195, paint);
         }
 
-        // Отрисовка падающей тени от каждой стены здания
         private void drawBuildingShadow(Canvas canvas, OsmBuilding b, float cx, float cy, float scale, float offX, float offY) {
             int n = b.xMeters.length;
             for (int i = 0; i < n; i++) {
@@ -978,17 +1031,14 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             }
         }
 
-        // РЕЖИМ 2: AR-КАМЕРА С ДУГАМИ СОЛНЦА, ДОМАМИ И 2D-НИВЕЛИРОМ
         private void drawARCameraOverlay(Canvas canvas, int w, int h) {
             float cx = w / 2f;
             float cy = h / 2f;
             float fovH = 60f;
             float fovV = 75f;
 
-            // 1. Отрисовка 3D-силуэтов соседних домов из OpenStreetMap поверх камеры
             drawOsmBuildingsInAR(canvas, w, h, fovH, fovV);
 
-            // 2. Линия горизонта
             float horizonY = cy + (camAltitude / fovV) * h;
             paint.setStyle(Paint.Style.STROKE);
             paint.setColor(Color.argb(160, 0, 255, 180));
@@ -1007,12 +1057,10 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 }
             }
 
-            // 3. Дуги Солнца (Зима, Лето, Выбранная дата)
             drawSunArc(canvas, w, h, fovH, fovV, 355, Color.argb(140, 100, 180, 255), false);
             drawSunArc(canvas, w, h, fovH, fovV, 172, Color.argb(140, 255, 120, 80), false);
             drawSunArc(canvas, w, h, fovH, fovV, selectedDayOfYear, Color.rgb(255, 230, 0), true);
 
-            // 4. Яркий маркер Солнца для выбранного на ползунке времени
             double[] curSun = computeSunPosition(latitude, selectedDayOfYear, selectedSolarHour);
             if (curSun[1] > -5.0) {
                 float sunX = azimuthToScreenX((float) curSun[0], w, fovH);
@@ -1029,7 +1077,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 canvas.drawCircle(sunX, sunY, 28f, paint);
             }
 
-            // 5. Цифровой 2D-нивелир в центре
             float calPitch = rawPitch - tarePitch;
             float calRoll = rawRoll - tareRoll;
             float levelRadius = 105f;
@@ -1048,7 +1095,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             canvas.drawCircle(bx, by, 20f, paint);
         }
 
-        // Проекция контуров крыш соседних зданий OSM в AR-видоискатель
         private void drawOsmBuildingsInAR(Canvas canvas, int w, int h, float fovH, float fovV) {
             float cy = h / 2f;
             paint.setStyle(Paint.Style.STROKE);
@@ -1115,11 +1161,11 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             canvas.drawText(String.format(Locale.US, "%s: %.1f ч (без тени домов: %.1f ч)",
                     selectedSeasonLabel, insolHours[0], insolHours[1]), 38, 280, paint);
 
-            paint.setTextSize(26f);
-            paint.setColor(Color.LTGRAY);
-            String gpsText = gpsLocked ? "GPS точный" : "GPS старт";
+            paint.setTextSize(25f);
+            paint.setColor(realOsmLoaded ? Color.rgb(120, 255, 160) : Color.rgb(255, 180, 100));
+            String gpsText = gpsLocked ? "GPS" : "Старт";
             canvas.drawText(String.format(Locale.US, "%.4f N, %.4f E [%s] | %s",
-                    latitude, longitude, gpsText, osmStatus), 38, 332, paint);
+                    latitude, longitude, gpsText, osmStatus), 38, 330, paint);
 
             paint.setColor(Color.rgb(140, 200, 255));
             canvas.drawText(is2DMapMode ? "Режим: 2D Генплан теней (нажмите на карту для зума)" :
@@ -1185,13 +1231,12 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             return "Черчение / Улица (>=500 лк)";
         }
 
-        // Возвращает {Астрономические часы света, Реальные часы света без тени соседних зданий}
         private float[] calculateInsolationWithOsm(double lat, int day) {
             float astroHours = 0f;
             float unblockedHours = 0f;
             for (double hr = 4.5; hr <= 21.5; hr += 0.25) {
                 double[] pos = computeSunPosition(lat, day, hr);
-                if (pos[1] > 0) {
+                if (pos[1] > 0.0) {
                     astroHours += 0.25f;
                     if (!isSunBlockedByOsmBuildings(pos[0], pos[1])) {
                         unblockedHours += 0.25f;
