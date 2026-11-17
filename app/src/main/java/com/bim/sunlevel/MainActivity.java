@@ -423,7 +423,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         return new float[]{astroHours, unblockedHours};
     }
 
-    // Метод экспорта логов в CSV (теперь возвращен на место)
     private void exportLogToCsv() {
         try {
             File dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
@@ -967,6 +966,221 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         return parsed.size();
     }
 
+    // --- Добавленные недостающие методы для устранения ошибок компиляции ---
+    private void captureARPhoto() {
+        int targetW = overlayView.getWidth();
+        int targetH = overlayView.getHeight();
+        if (targetW <= 0 || targetH <= 0) return;
+
+        if (is2DMapMode || camera == null) {
+            saveCombinedBitmapToGallery(null, targetW, targetH);
+            return;
+        }
+
+        try {
+            camera.setOneShotPreviewCallback((data, cam) -> {
+                try {
+                    Camera.Parameters params = cam.getParameters();
+                    Camera.Size prevSize = params.getPreviewSize();
+
+                    YuvImage yuvImage = new YuvImage(data, ImageFormat.NV21, prevSize.width, prevSize.height, null);
+                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                    yuvImage.compressToJpeg(new Rect(0, 0, prevSize.width, prevSize.height), 95, baos);
+                    byte[] jpegBytes = baos.toByteArray();
+                    Bitmap rawCamBitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.length);
+
+                    Matrix matrix = new Matrix();
+                    matrix.postRotate(90);
+                    Bitmap rotatedCamBitmap = Bitmap.createBitmap(
+                            rawCamBitmap, 0, 0, rawCamBitmap.getWidth(), rawCamBitmap.getHeight(), matrix, true
+                    );
+                    rawCamBitmap.recycle();
+
+                    saveCombinedBitmapToGallery(rotatedCamBitmap, targetW, targetH);
+                } catch (Exception e) {
+                    Toast.makeText(this, "Ошибка сохранения фото: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+                }
+            });
+        } catch (Exception e) {
+            Toast.makeText(this, "Сбой захвата кадра: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void saveCombinedBitmapToGallery(Bitmap cameraBitmap, int targetW, int targetH) {
+        try {
+            Bitmap combinedBitmap = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888);
+            Canvas comboCanvas = new Canvas(combinedBitmap);
+
+            if (cameraBitmap != null) {
+                Rect destRect = new Rect(0, 0, targetW, targetH);
+                comboCanvas.drawBitmap(cameraBitmap, null, destRect, null);
+                cameraBitmap.recycle();
+            }
+
+            overlayView.draw(comboCanvas);
+
+            Paint stampPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            stampPaint.setColor(Color.argb(210, 15, 20, 28));
+            comboCanvas.drawRoundRect(new RectF(20, targetH - 220, targetW - 20, targetH - 155), 16f, 16f, stampPaint);
+
+            stampPaint.setColor(Color.rgb(255, 220, 90));
+            stampPaint.setTextSize(28f);
+            String timeStamp = new SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.US).format(new Date());
+            comboCanvas.drawText("ШТАМП ФИКСАЦИИ: " + timeStamp + " | " + formatClockHour(selectedClockHour, isLiveTime), 40, targetH - 178, stampPaint);
+
+            String fileName = "BIM_AR_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date()) + ".jpg";
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.Images.Media.DISPLAY_NAME, fileName);
+            values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+            values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/BIM_SunLevel");
+
+            Uri uri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+            if (uri != null) {
+                OutputStream out = getContentResolver().openOutputStream(uri);
+                if (out != null) {
+                    combinedBitmap.compress(Bitmap.CompressFormat.JPEG, 92, out);
+                    out.flush();
+                    out.close();
+                }
+                Toast.makeText(this, "Сохранено в Галерею (BIM_SunLevel)", Toast.LENGTH_LONG).show();
+            }
+            combinedBitmap.recycle();
+        } catch (Exception e) {
+            Toast.makeText(this, "Ошибка записи: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void requestPermissionsIfNeeded() {
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED ||
+            checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{
+                    Manifest.permission.CAMERA,
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+            }, 101);
+        } else {
+            startLocationUpdates();
+        }
+    }
+
+    @Override
+    public void onAccuracyChanged(Sensor sensor, int accuracy) {
+        // Обязательный метод интерфейса SensorEventListener
+    }
+    // ---------------------------------------------------------------------
+
+    private void requestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        if (requestCode == 101) {
+            boolean camGranted = false;
+            for (int i = 0; i < permissions.length; i++) {
+                if (permissions[i].equals(Manifest.permission.CAMERA) && grantResults[i] == PackageManager.PERMISSION_GRANTED) {
+                    camGranted = true;
+                }
+            }
+            startLocationUpdates();
+            if (camGranted && cameraSurface.getHolder().getSurface().isValid()) {
+                startCameraPreview(cameraSurface.getHolder());
+            }
+        }
+    }
+
+    private void startLocationUpdates() {
+        try {
+            if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                Location last = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+                if (last == null) last = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+                if (last != null) {
+                    onNewLocation(last);
+                }
+                LocationListener listener = this::onNewLocation;
+                locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 5000, 5f, listener);
+                locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 5000, 5f, listener);
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private void onNewLocation(Location loc) {
+        latitude = loc.getLatitude();
+        longitude = loc.getLongitude();
+        gpsLocked = true;
+        double distSq = Math.pow((latitude - lastOsmLat) * 111132.0, 2) +
+                        Math.pow((longitude - lastOsmLon) * 65000.0, 2);
+        if (!realOsmLoaded || distSq > 2500.0) {
+            fetchOsmBuildings(latitude, longitude);
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (sensorManager != null) {
+            if (rotSensor != null) sensorManager.registerListener(this, rotSensor, SensorManager.SENSOR_DELAY_GAME);
+            if (accelSensor != null) sensorManager.registerListener(this, accelSensor, SensorManager.SENSOR_DELAY_UI);
+            if (pressureSensor != null) sensorManager.registerListener(this, pressureSensor, SensorManager.SENSOR_DELAY_UI);
+            if (lightSensor != null) sensorManager.registerListener(this, lightSensor, SensorManager.SENSOR_DELAY_UI);
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        if (sensorManager != null) sensorManager.unregisterListener(this);
+    }
+
+    @Override
+    public void onSensorChanged(SensorEvent event) {
+        int type = event.sensor.getType();
+        if (type == Sensor.TYPE_ROTATION_VECTOR) {
+            SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values);
+            SensorManager.remapCoordinateSystem(rotationMatrix,
+                    SensorManager.AXIS_X, SensorManager.AXIS_Z, remappedMatrix);
+            SensorManager.getOrientation(remappedMatrix, orientationVals);
+
+            float az = (float) Math.toDegrees(orientationVals[0]);
+            if (az < 0) az += 360f;
+            float alt = (float) -Math.toDegrees(orientationVals[1]);
+            float roll = (float) Math.toDegrees(orientationVals[2]);
+
+            camAzimuth = lowPassAngle(az, camAzimuth, 0.15f);
+            camAltitude = camAltitude + 0.15f * (alt - camAltitude);
+            camRoll = camRoll + 0.15f * (roll - camRoll);
+
+        } else if (type == Sensor.TYPE_ACCELEROMETER) {
+            float gx = event.values[0];
+            float gy = event.values[1];
+            float gz = event.values[2];
+            float pitchDeg = (float) Math.toDegrees(Math.atan2(gy, Math.sqrt(gx * gx + gz * gz)));
+            float rollDeg = (float) Math.toDegrees(Math.atan2(-gx, Math.sqrt(gy * gy + gz * gz)));
+            rawPitch = rawPitch + 0.12f * (pitchDeg - rawPitch);
+            rawRoll = rawRoll + 0.12f * (rollDeg - rawRoll);
+
+        } else if (type == Sensor.TYPE_PRESSURE) {
+            currentPressure = (basePressure < 0) ? event.values[0] : (currentPressure + 0.15f * (event.values[0] - currentPressure));
+            if (basePressure < 0) basePressure = currentPressure;
+
+            float deltaFromBase = 44330f * (1f - (float) Math.pow(currentPressure / basePressure, 0.190295f));
+            relativeHeightMeters = calibratedBaseHeight + deltaFromBase;
+
+        } else if (type == Sensor.TYPE_LIGHT) {
+            currentLux = event.values[0];
+        }
+
+        if (isLiveTime) {
+            syncWithRealTime();
+        }
+        if (overlayView != null) overlayView.invalidate();
+    }
+
+    private float lowPassAngle(float newAngle, float oldAngle, float alpha) {
+        float diff = newAngle - oldAngle;
+        if (diff > 180f) diff -= 360f;
+        if (diff < -180f) diff += 360f;
+        float res = oldAngle + alpha * diff;
+        if (res < 0) res += 360f;
+        if (res >= 360f) res -= 360f;
+        return res;
+    }
+
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
         if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
@@ -1250,7 +1464,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             paint.setColor(isLevel ? Color.GREEN : (isLightFieldTheme ? Color.BLACK : Color.WHITE));
             canvas.drawCircle(cx, cy, levelRadius, paint);
             
-            // Исправленная отрисовка осей уровня с правильными 4 координатами
             canvas.drawLine(cx - levelRadius - 20, cy, cx + levelRadius + 20, cy, paint);
             canvas.drawLine(cx, cy - levelRadius - 20, cx, cy + levelRadius + 20, paint);
 
