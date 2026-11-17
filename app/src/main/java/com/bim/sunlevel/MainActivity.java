@@ -104,17 +104,13 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private float relativeHeightMeters = 12.0f;
     private float currentLux = 0f;
 
-    // Расширенные данные КЕО по точкам контроля (СП 52.13330)
     private float externalLuxForKeo = -1f;
     private float keoWindowLux = -1f;
     private float keoCenterLux = -1f;
     private float keoBackLux = -1f;
     private float lastCalculatedKeo = -1f;
 
-    // Пользовательский проектный контур (импорт DXF/точек)
     private final List<float[]> customProjectPolygon = new ArrayList<>();
-
-    // Настройки интерфейса: тема (false = темная, true = светлая полевая)
     private boolean isLightFieldTheme = false;
 
     private int selectedDayOfYear = 80;
@@ -251,7 +247,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         sliderRow.addView(timeSeekBar);
         bottomContainer.addView(sliderRow);
 
-        // Нижняя панель инструментов
         LinearLayout bottomBar = new LinearLayout(this);
         bottomBar.setOrientation(LinearLayout.HORIZONTAL);
         bottomBar.setGravity(Gravity.CENTER);
@@ -314,6 +309,102 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         fetchOsmBuildings(latitude, longitude);
     }
 
+    // --- Методы расчета инсоляции и СанПиН (вынесены на уровень MainActivity) ---
+    private double[] computeSunPosition(double latDeg, int dayOfYear, double localClockHour) {
+        double tzHours = TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 3600000.0;
+        double bRad = Math.toRadians((360.0 / 365.0) * (dayOfYear - 81));
+        double eotMinutes = 9.87 * Math.sin(2.0 * bRad) - 7.53 * Math.cos(bRad) - 1.5 * Math.sin(bRad);
+        double timeCorrectionMinutes = 4.0 * (longitude - 15.0 * tzHours) + eotMinutes;
+        double trueSolarHour = localClockHour + (timeCorrectionMinutes / 60.0);
+
+        double latRad = Math.toRadians(latDeg);
+        double declDeg = 23.45 * Math.sin(Math.toRadians((360.0 / 365.0) * (284 + dayOfYear)));
+        double declRad = Math.toRadians(declDeg);
+        double hourAngleRad = Math.toRadians(15.0 * (trueSolarHour - 12.0));
+
+        double sinAlt = Math.sin(latRad) * Math.sin(declRad) +
+                        Math.cos(latRad) * Math.cos(declRad) * Math.cos(hourAngleRad);
+        sinAlt = Math.max(-1.0, Math.min(1.0, sinAlt));
+        double altRad = Math.asin(sinAlt);
+
+        double cosAz = (Math.sin(declRad) - Math.sin(altRad) * Math.sin(latRad)) /
+                       (Math.cos(altRad) * Math.cos(latRad) + 1e-6);
+        cosAz = Math.max(-1.0, Math.min(1.0, cosAz));
+        double azDeg = Math.toDegrees(Math.acos(cosAz));
+
+        double normSolar = ((trueSolarHour % 24.0) + 24.0) % 24.0;
+        if (normSolar > 12.0) azDeg = 360.0 - azDeg;
+
+        return new double[]{azDeg, Math.toDegrees(altRad)};
+    }
+
+    private boolean isSunBlockedByOsmBuildings(double sunAzDeg, double sunAltDeg) {
+        if (sunAltDeg <= 0.0) return true;
+        double tanAlt = Math.tan(Math.toRadians(Math.max(0.2, sunAltDeg)));
+        double rayDirX = Math.sin(Math.toRadians(sunAzDeg));
+        double rayDirY = Math.cos(Math.toRadians(sunAzDeg));
+
+        synchronized (osmBuildings) {
+            for (OsmBuilding b : osmBuildings) {
+                float dh = b.heightMeters - relativeHeightMeters;
+                if (dh <= 0.5f) continue;
+
+                if (isPointInPolygon(0f, 0f, b.xMeters, b.yMeters)) continue;
+
+                float maxShadowDist = (float) (dh / tanAlt);
+                int n = b.xMeters.length;
+                for (int i = 0; i < n; i++) {
+                    float x1 = b.xMeters[i], y1 = b.yMeters[i];
+                    float x2 = b.xMeters[(i + 1) % n], y2 = b.yMeters[(i + 1) % n];
+                    float dist = intersectRayWithSegment((float) rayDirX, (float) rayDirY, x1, y1, x2, y2);
+                    if (dist > 3.0f && dist <= maxShadowDist) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean isPointInPolygon(float px, float py, float[] vx, float[] vy) {
+        boolean inside = false;
+        int n = vx.length;
+        for (int i = 0, j = n - 1; i < n; j = i++) {
+            if (((vy[i] > py) != (vy[j] > py)) &&
+                (px < (vx[j] - vx[i]) * (py - vy[i]) / (vy[j] - vy[i] + 1e-6f) + vx[i])) {
+                inside = !inside;
+            }
+        }
+        return inside;
+    }
+
+    private float intersectRayWithSegment(float dx, float dy, float x1, float y1, float x2, float y2) {
+        float sx = x2 - x1;
+        float sy = y2 - y1;
+        float det = -dx * sy + dy * sx;
+        if (Math.abs(det) < 1e-5f) return -1f;
+        float t = (-sy * (-x1) + sx * (-y1)) / det;
+        float u = (dx * (-y1) - dy * (-x1)) / det;
+        if (t >= 0f && u >= 0f && u <= 1f) return t;
+        return -1f;
+    }
+
+    private float[] calculateInsolationWithOsm(double lat, int day) {
+        float astroHours = 0f;
+        float unblockedHours = 0f;
+        for (double hr = 4.0; hr <= 22.0; hr += 0.25) {
+            double[] pos = computeSunPosition(lat, day, hr);
+            if (pos[1] > 0.0) {
+                astroHours += 0.25f;
+                if (!isSunBlockedByOsmBuildings(pos[0], pos[1])) {
+                    unblockedHours += 0.25f;
+                }
+            }
+        }
+        return new float[]{astroHours, unblockedHours};
+    }
+    // ---------------------------------------------------------------------
+
     private void showProjectAndReportMenu() {
         CharSequence[] items = new X().items(
                 "1. Импортировать проектный контур (DXF/TXT)",
@@ -340,7 +431,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         CharSequence[] items(CharSequence... c) { return c; }
     }
 
-    // Импорт проектного контура из файла в Download/project_contour.txt (формат: X Y на каждую строку в метрах)
     private void importCustomPolygonDialog() {
         try {
             File dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
@@ -375,7 +465,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         }
     }
 
-    // Генерация строительного акта инспекции в текстовом/PDF формате в Download/BIM_Reports
     private void generateInspectionReportPdf() {
         try {
             File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "BIM_Reports");
@@ -411,7 +500,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         }
     }
 
-    // Сетка контроля КЕО по точкам (СП 52.13330)
     private void showKeoGridDialog() {
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
         builder.setTitle("Сетка контроля КЕО по точкам (СП 52.13330)");
@@ -449,7 +537,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                     else if (which == 2) keoBackLux = currentLux;
 
                     if (externalLuxForKeo > 0 && keoWindowLux > 0 && keoCenterLux > 0 && keoBackLux > 0) {
-                        lastCalculatedKeo = (keoCenterLux / externalLuxForKeo) * 100.0f; // Усреднение по центру комнаты
+                        lastCalculatedKeo = (keoCenterLux / externalLuxForKeo) * 100.0f;
                     } else if (currentLux > 0 && externalLuxForKeo > 0) {
                         lastCalculatedKeo = (currentLux / externalLuxForKeo) * 100.0f;
                     }
@@ -1020,112 +1108,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     @Override
     public void onAccuracyChanged(Sensor sensor, int accuracy) {}
 
-    private double[] computeSunPosition(double latDeg, int dayOfYear, double localClockHour) {
-        double tzHours = TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 3600000.0;
-        double bRad = Math.toRadians((360.0 / 365.0) * (dayOfYear - 81));
-        double eotMinutes = 9.87 * Math.sin(2.0 * bRad) - 7.53 * Math.cos(bRad) - 1.5 * Math.sin(bRad);
-        double timeCorrectionMinutes = 4.0 * (longitude - 15.0 * tzHours) + eotMinutes;
-        double trueSolarHour = localClockHour + (timeCorrectionMinutes / 60.0);
-
-        double latRad = Math.toRadians(latDeg);
-        double declDeg = 23.45 * Math.sin(Math.toRadians((360.0 / 365.0) * (284 + dayOfYear)));
-        double declRad = Math.toRadians(declDeg);
-        double hourAngleRad = Math.toRadians(15.0 * (trueSolarHour - 12.0));
-
-        double sinAlt = Math.sin(latRad) * Math.sin(declRad) +
-                        Math.cos(latRad) * Math.cos(declRad) * Math.cos(hourAngleRad);
-        sinAlt = Math.max(-1.0, Math.min(1.0, sinAlt));
-        double altRad = Math.asin(sinAlt);
-
-        double cosAz = (Math.sin(declRad) - Math.sin(altRad) * Math.sin(latRad)) /
-                       (Math.cos(altRad) * Math.cos(latRad) + 1e-6);
-        cosAz = Math.max(-1.0, Math.min(1.0, cosAz));
-        double azDeg = Math.toDegrees(Math.acos(cosAz));
-
-        double normSolar = ((trueSolarHour % 24.0) + 24.0) % 24.0;
-        if (normSolar > 12.0) azDeg = 360.0 - azDeg;
-
-        return new double[]{azDeg, Math.toDegrees(altRad)};
-    }
-
-    private boolean isSunBlockedByOsmBuildings(double sunAzDeg, double sunAltDeg) {
-        if (sunAltDeg <= 0.0) return true;
-        double tanAlt = Math.tan(Math.toRadians(Math.max(0.2, sunAltDeg)));
-        double rayDirX = Math.sin(Math.toRadians(sunAzDeg));
-        double rayDirY = Math.cos(Math.toRadians(sunAzDeg));
-
-        synchronized (osmBuildings) {
-            for (OsmBuilding b : osmBuildings) {
-                float dh = b.heightMeters - relativeHeightMeters;
-                if (dh <= 0.5f) continue;
-
-                if (isPointInPolygon(0f, 0f, b.xMeters, b.yMeters)) continue;
-
-                float maxShadowDist = (float) (dh / tanAlt);
-                int n = b.xMeters.length;
-                for (int i = 0; i < n; i++) {
-                    float x1 = b.xMeters[i], y1 = b.yMeters[i];
-                    float x2 = b.xMeters[(i + 1) % n], y2 = b.yMeters[(i + 1) % n];
-                    float dist = intersectRayWithSegment((float) rayDirX, (float) rayDirY, x1, y1, x2, y2);
-                    if (dist > 3.0f && dist <= maxShadowDist) {
-                        return true;
-                    }
-                }
-            }
-        }
-        return false;
-    }
-
-    private boolean isPointInPolygon(float px, float py, float[] vx, float[] vy) {
-        boolean inside = false;
-        int n = vx.length;
-        for (int i = 0, j = n - 1; i < n; j = i++) {
-            if (((vy[i] > py) != (vy[j] > py)) &&
-                (px < (vx[j] - vx[i]) * (py - vy[i]) / (vy[j] - vy[i] + 1e-6f) + vx[i])) {
-                inside = !inside;
-            }
-        }
-        return inside;
-    }
-
-    private float intersectRayWithSegment(float dx, float dy, float x1, float y1, float x2, float y2) {
-        float sx = x2 - x1;
-        float sy = y2 - y1;
-        float det = -dx * sy + dy * sx;
-        if (Math.abs(det) < 1e-5f) return -1f;
-        float t = (-sy * (-x1) + sx * (-y1)) / det;
-        float u = (dx * (-y1) - dy * (-x1)) / det;
-        if (t >= 0f && u >= 0f && u <= 1f) return t;
-        return -1f;
-    }
-
-    private void exportLogToCsv() {
-        try {
-            File dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
-            if (!dir.exists()) dir.mkdirs();
-            File file = new File(dir, "BIM_Field_Log.csv");
-            boolean isNew = !file.exists();
-
-            FileWriter fw = new FileWriter(file, true);
-            if (isNew) {
-                fw.append("Timestamp,Lat,Lon,CamAzimuth_deg,CamAltitude_deg,SlopePitch_deg,Slope_mm_per_m,Lux,KEO_percent,DeltaHeight_m,EstFloor,ClockHour\n");
-            }
-            String ts = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date());
-            float calPitch = rawPitch - tarePitch;
-            float mmPerMeter = (float) (Math.tan(Math.toRadians(Math.abs(calPitch))) * 1000.0);
-            int estFloor = Math.round(relativeHeightMeters / floorHeightMeters) + 1;
-
-            fw.append(String.format(Locale.US, "%s,%.5f,%.5f,%.1f,%.1f,%.2f,%.1f,%.0f,%.2f,%.2f,%d,%.2f\n",
-                    ts, latitude, longitude, camAzimuth, camAltitude, calPitch, mmPerMeter,
-                    currentLux, lastCalculatedKeo, relativeHeightMeters, estFloor, selectedClockHour));
-            fw.flush();
-            fw.close();
-            Toast.makeText(this, "Сохранено в Download/BIM_Field_Log.csv", Toast.LENGTH_LONG).show();
-        } catch (Exception e) {
-            Toast.makeText(this, "Ошибка записи: " + e.getMessage(), Toast.LENGTH_SHORT).show();
-        }
-    }
-
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
         if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
@@ -1175,7 +1157,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             int w = getWidth();
             int h = getHeight();
 
-            // Динамический выбор палитры темы (Темная vs Светлая полевая)
             int bgColor = isLightFieldTheme ? Color.rgb(240, 244, 248) : Color.rgb(14, 22, 34);
             canvas.drawColor(bgColor);
 
@@ -1222,7 +1203,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             float startAngle2D = camAzimuth - 90f - 30f;
             canvas.drawArc(fovRect, startAngle2D, 60f, true, paint);
 
-            // Отрисовка пользовательского проектного контура (DXF) зеленой пунктирной линией
             synchronized (customProjectPolygon) {
                 if (!customProjectPolygon.isEmpty()) {
                     paint.setStyle(Paint.Style.STROKE);
@@ -1406,7 +1386,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             paint.setColor(isLevel ? Color.GREEN : (isLightFieldTheme ? Color.BLACK : Color.WHITE));
             canvas.drawCircle(cx, cy, levelRadius, paint);
             canvas.drawLine(cx - levelRadius - 20, cy, cx + levelRadius + 20, cy, paint);
-            canvas.drawLine(cx, cy - levelRadius - 20, cx, cy + levelRadius + 20, paint);
+            canvas.drawLine(cx, cy - levelRadius - 20, cx, cy + levelRadius + 20, cy, paint);
 
             float bx = cx + Math.max(-levelRadius, Math.min(levelRadius, (calRoll / 15f) * levelRadius));
             float by = cy + Math.max(-levelRadius, Math.min(levelRadius, (calPitch / 15f) * levelRadius));
@@ -1553,21 +1533,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             if (lux < 300) return "Офис / Кухня (>=200-300 лк)";
             if (lux < 500) return "Рабочий кабинет (300-500 лк)";
             return "Черчение / Улица (>=500 лк)";
-        }
-
-        private float[] calculateInsolationWithOsm(double lat, int day) {
-            float astroHours = 0f;
-            float unblockedHours = 0f;
-            for (double hr = 4.0; hr <= 22.0; hr += 0.25) {
-                double[] pos = computeSunPosition(lat, day, hr);
-                if (pos[1] > 0.0) {
-                    astroHours += 0.25f;
-                    if (!isSunBlockedByOsmBuildings(pos[0], pos[1])) {
-                        unblockedHours += 0.25f;
-                    }
-                }
-            }
-            return new float[]{astroHours, unblockedHours};
         }
     }
 }
