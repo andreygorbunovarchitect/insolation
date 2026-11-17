@@ -258,16 +258,16 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             overlayView.invalidate();
         });
 
-        Button btnKeo = createButton("КЕО/СП", Color.argb(230, 160, 50, 180));
+        Button btnKeo = createButton("КЕО", Color.argb(230, 160, 50, 180));
         btnKeo.setOnClickListener(v -> showKeoGridDialog());
 
-        Button btnProject = createButton("DXF/PDF", Color.argb(230, 40, 130, 90));
-        btnProject.setOnClickListener(v -> showProjectAndReportMenu());
+        Button btnTools = createButton("DXF/Рулетка", Color.argb(230, 40, 130, 90));
+        btnTools.setOnClickListener(v -> showProjectAndToolsMenu());
 
         Button btnTheme = createButton("Тема", Color.argb(210, 80, 90, 110));
         btnTheme.setOnClickListener(v -> {
             isLightFieldTheme = !isLightFieldTheme;
-            Toast.makeText(this, isLightFieldTheme ? "Включена светлая полевая тема" : "Включена темная тема", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, isLightFieldTheme ? "Светлая полевая тема" : "Темная тема", Toast.LENGTH_SHORT).show();
             overlayView.invalidate();
         });
 
@@ -279,7 +279,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
 
         bottomBar.addView(btnModeToggle);
         bottomBar.addView(btnKeo);
-        bottomBar.addView(btnProject);
+        bottomBar.addView(btnTools);
         bottomBar.addView(btnTheme);
         bottomBar.addView(btnPhoto);
         bottomBar.addView(btnSave);
@@ -309,7 +309,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         fetchOsmBuildings(latitude, longitude);
     }
 
-    // --- Методы расчета инсоляции и СанПиН (вынесены на уровень MainActivity) ---
     private double[] computeSunPosition(double latDeg, int dayOfYear, double localClockHour) {
         double tzHours = TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 3600000.0;
         double bRad = Math.toRadians((360.0 / 365.0) * (dayOfYear - 81));
@@ -348,7 +347,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             for (OsmBuilding b : osmBuildings) {
                 float dh = b.heightMeters - relativeHeightMeters;
                 if (dh <= 0.5f) continue;
-
                 if (isPointInPolygon(0f, 0f, b.xMeters, b.yMeters)) continue;
 
                 float maxShadowDist = (float) (dh / tanAlt);
@@ -361,6 +359,27 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                         return true;
                     }
                 }
+            }
+        }
+        return false;
+    }
+
+    private boolean doesBuildingBlockSun(OsmBuilding b, double sunAzDeg, double sunAltDeg) {
+        if (sunAltDeg <= 0.5) return false;
+        float dh = b.heightMeters - relativeHeightMeters;
+        if (dh <= 0.5f) return false;
+        if (isPointInPolygon(0f, 0f, b.xMeters, b.yMeters)) return false;
+        double tanAlt = Math.max(0.08, Math.tan(Math.toRadians(sunAltDeg)));
+        float maxShadowDist = (float) (dh / tanAlt);
+        double rayDirX = Math.sin(Math.toRadians(sunAzDeg));
+        double rayDirY = Math.cos(Math.toRadians(sunAzDeg));
+        int n = b.xMeters.length;
+        for (int i = 0; i < n; i++) {
+            float x1 = b.xMeters[i], y1 = b.yMeters[i];
+            float x2 = b.xMeters[(i + 1) % n], y2 = b.yMeters[(i + 1) % n];
+            float dist = intersectRayWithSegment((float) rayDirX, (float) rayDirY, x1, y1, x2, y2);
+            if (dist > 2.0f && dist <= maxShadowDist) {
+                return true;
             }
         }
         return false;
@@ -403,26 +422,50 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         }
         return new float[]{astroHours, unblockedHours};
     }
-    // ---------------------------------------------------------------------
 
-    private void showProjectAndReportMenu() {
+    // Метод экспорта логов в CSV (теперь возвращен на место)
+    private void exportLogToCsv() {
+        try {
+            File dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+            if (!dir.exists()) dir.mkdirs();
+            File file = new File(dir, "BIM_Field_Log.csv");
+            boolean isNew = !file.exists();
+
+            FileWriter fw = new FileWriter(file, true);
+            if (isNew) {
+                fw.append("Timestamp,Lat,Lon,CamAzimuth_deg,CamAltitude_deg,SlopePitch_deg,Slope_mm_per_m,Lux,KEO_percent,DeltaHeight_m,EstFloor,ClockHour\n");
+            }
+            String ts = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date());
+            float calPitch = rawPitch - tarePitch;
+            float mmPerMeter = (float) (Math.tan(Math.toRadians(Math.abs(calPitch))) * 1000.0);
+            int estFloor = Math.round(relativeHeightMeters / floorHeightMeters) + 1;
+
+            fw.append(String.format(Locale.US, "%s,%.5f,%.5f,%.1f,%.1f,%.2f,%.1f,%.0f,%.2f,%.2f,%d,%.2f\n",
+                    ts, latitude, longitude, camAzimuth, camAltitude, calPitch, mmPerMeter,
+                    currentLux, lastCalculatedKeo, relativeHeightMeters, estFloor, selectedClockHour));
+            fw.flush();
+            fw.close();
+            Toast.makeText(this, "Сохранено в Download/BIM_Field_Log.csv", Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "Ошибка записи: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void showProjectAndToolsMenu() {
         CharSequence[] items = new X().items(
                 "1. Импортировать проектный контур (DXF/TXT)",
-                "2. Генерация акта инспекции (PDF/TXT)",
-                "3. Обнулить уклономер (Тара 0°)",
-                "4. Калибровка этажа (Высота)"
+                "2. AR-рулетка (Расчет высоты/расстояния)",
+                "3. Генерация акта инспекции (Отчет)",
+                "4. Калибровка этажа и высоты"
         );
 
         new AlertDialog.Builder(this)
-                .setTitle("Проектные данные и отчеты")
+                .setTitle("Инструменты инженера и САПР")
                 .setItems(items, (dialog, which) -> {
                     if (which == 0) importCustomPolygonDialog();
-                    else if (which == 1) generateInspectionReportPdf();
-                    else if (which == 2) {
-                        tarePitch = rawPitch;
-                        tareRoll = rawRoll;
-                        Toast.makeText(this, "Уклономер обнулен (0.0°)", Toast.LENGTH_SHORT).show();
-                    } else if (which == 3) showAltitudeCalibrationDialog();
+                    else if (which == 1) showArTapeMeasureDialog();
+                    else if (which == 2) generateInspectionReportPdf();
+                    else if (which == 3) showAltitudeCalibrationDialog();
                 })
                 .show();
     }
@@ -431,13 +474,41 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         CharSequence[] items(CharSequence... c) { return c; }
     }
 
+    private void showArTapeMeasureDialog() {
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(50, 30, 50, 10);
+
+        final EditText inputH = new EditText(this);
+        inputH.setHint("Превышение ΔH до объекта (м)");
+        inputH.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        inputH.setText("3.0");
+        layout.addView(inputH);
+
+        new AlertDialog.Builder(this)
+                .setTitle("AR-рулетка (Тригонометрический замер)")
+                .setMessage("Наведите камеру на верхнюю точку объекта (укажите ΔH от уровня глаз) или замерьте по углу наклона:")
+                .setView(layout)
+                .setPositiveButton("Рассчитать дистанцию", (dialog, which) -> {
+                    try {
+                        float dh = Float.parseFloat(inputH.getText().toString().trim());
+                        float angleRad = Math.abs((float) Math.toRadians(rawPitch - tarePitch));
+                        if (angleRad < 0.01f) angleRad = 0.01f;
+                        float dist = (float) (dh / Math.tan(angleRad));
+                        Toast.makeText(this, String.format(Locale.US, "Расстояние до объекта: %.2f м (Уклон: %.1f°)", dist, (rawPitch - tarePitch)), Toast.LENGTH_LONG).show();
+                    } catch (Exception ignored) {}
+                })
+                .setNegativeButton("Отмена", null)
+                .show();
+    }
+
     private void importCustomPolygonDialog() {
         try {
             File dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
             File file = new File(dir, "project_contour.txt");
             if (!file.exists()) {
                 FileWriter fw = new FileWriter(file);
-                fw.append("-10 -10\n10 -10\n10 10\n-10 10\n");
+                fw.append("-12 -12\n12 -12\n12 12\n-12 12\n");
                 fw.flush();
                 fw.close();
                 Toast.makeText(this, "Создан шаблон Download/project_contour.txt. Запишите в него точки X Y", Toast.LENGTH_LONG).show();
@@ -479,14 +550,14 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             FileWriter fw = new FileWriter(reportFile);
             fw.append("========================================\n");
             fw.append(" ОФИЦИАЛЬНЫЙ АКТ ИНСПЕКЦИИ И СТРОЙКОНТРОЛЯ\n");
-            fw.append(" Проектный модуль BIM Sun & Level\n");
+            fw.append(" Мобильный комплекс BIM Sun & Level\n");
             fw.append("========================================\n");
             fw.append("Дата и время: ").append(new SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.US).format(new Date())).append("\n");
             fw.append(String.format(Locale.US, "Координаты GPS: %.5f N, %.5f E\n", latitude, longitude));
             fw.append(String.format(Locale.US, "Высотная отметка H: %+.2f м (~%d этаж)\n", relativeHeightMeters, estFloor));
             fw.append("----------------------------------------\n");
             fw.append(String.format(Locale.US, "Освещенность фактическая: %.0f лк\n", currentLux));
-            fw.append(String.format(Locale.US, "Коэффициент КЕО: %s\n", lastCalculatedKeo > 0 ? String.format(Locale.US, "%.2f%%", lastCalculatedKeo) : "не замерялся"));
+            fw.append(String.format(Locale.US, "Коэффициент КЕО (по точкам): %s\n", lastCalculatedKeo > 0 ? String.format(Locale.US, "%.2f%%", lastCalculatedKeo) : "не замерялся"));
             fw.append("----------------------------------------\n");
             fw.append(String.format(Locale.US, "Норматив инсоляции СанПиН / СП 42:\nСтатус: %s\n", sanPinPass ? "СОБЛЮДЕНА (≥2.0 ч)" : "НАРУШЕНИЕ (<2.0 ч)"));
             fw.append(String.format(Locale.US, "Непрерывное солнце без тени: %.1f ч (астрон: %.1f ч)\n", insol[1], insol[0]));
@@ -896,218 +967,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         return parsed.size();
     }
 
-    private void captureARPhoto() {
-        int targetW = overlayView.getWidth();
-        int targetH = overlayView.getHeight();
-        if (targetW <= 0 || targetH <= 0) return;
-
-        if (is2DMapMode || camera == null) {
-            saveCombinedBitmapToGallery(null, targetW, targetH);
-            return;
-        }
-
-        try {
-            camera.setOneShotPreviewCallback((data, cam) -> {
-                try {
-                    Camera.Parameters params = cam.getParameters();
-                    Camera.Size prevSize = params.getPreviewSize();
-
-                    YuvImage yuvImage = new YuvImage(data, ImageFormat.NV21, prevSize.width, prevSize.height, null);
-                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                    yuvImage.compressToJpeg(new Rect(0, 0, prevSize.width, prevSize.height), 95, baos);
-                    byte[] jpegBytes = baos.toByteArray();
-                    Bitmap rawCamBitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.length);
-
-                    Matrix matrix = new Matrix();
-                    matrix.postRotate(90);
-                    Bitmap rotatedCamBitmap = Bitmap.createBitmap(
-                            rawCamBitmap, 0, 0, rawCamBitmap.getWidth(), rawCamBitmap.getHeight(), matrix, true
-                    );
-                    rawCamBitmap.recycle();
-
-                    saveCombinedBitmapToGallery(rotatedCamBitmap, targetW, targetH);
-                } catch (Exception e) {
-                    Toast.makeText(this, "Ошибка сохранения фото: " + e.getMessage(), Toast.LENGTH_SHORT).show();
-                }
-            });
-        } catch (Exception e) {
-            Toast.makeText(this, "Сбой захвата кадра: " + e.getMessage(), Toast.LENGTH_SHORT).show();
-        }
-    }
-
-    private void saveCombinedBitmapToGallery(Bitmap cameraBitmap, int targetW, int targetH) {
-        try {
-            Bitmap combinedBitmap = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888);
-            Canvas comboCanvas = new Canvas(combinedBitmap);
-
-            if (cameraBitmap != null) {
-                Rect destRect = new Rect(0, 0, targetW, targetH);
-                comboCanvas.drawBitmap(cameraBitmap, null, destRect, null);
-                cameraBitmap.recycle();
-            }
-
-            overlayView.draw(comboCanvas);
-
-            Paint stampPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-            stampPaint.setColor(Color.argb(210, 15, 20, 28));
-            comboCanvas.drawRoundRect(new RectF(20, targetH - 220, targetW - 20, targetH - 155), 16f, 16f, stampPaint);
-
-            stampPaint.setColor(Color.rgb(255, 220, 90));
-            stampPaint.setTextSize(28f);
-            String timeStamp = new SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.US).format(new Date());
-            comboCanvas.drawText("ШТАМП ФИКСАЦИИ: " + timeStamp + " | " + formatClockHour(selectedClockHour, isLiveTime), 40, targetH - 178, stampPaint);
-
-            String fileName = "BIM_AR_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date()) + ".jpg";
-            ContentValues values = new ContentValues();
-            values.put(MediaStore.Images.Media.DISPLAY_NAME, fileName);
-            values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
-            values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/BIM_SunLevel");
-
-            Uri uri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
-            if (uri != null) {
-                OutputStream out = getContentResolver().openOutputStream(uri);
-                if (out != null) {
-                    combinedBitmap.compress(Bitmap.CompressFormat.JPEG, 92, out);
-                    out.flush();
-                    out.close();
-                }
-                Toast.makeText(this, "Сохранено в Галерею (BIM_SunLevel)", Toast.LENGTH_LONG).show();
-            }
-            combinedBitmap.recycle();
-        } catch (Exception e) {
-            Toast.makeText(this, "Ошибка записи: " + e.getMessage(), Toast.LENGTH_SHORT).show();
-        }
-    }
-
-    private void requestPermissionsIfNeeded() {
-        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED ||
-            checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{
-                    Manifest.permission.CAMERA,
-                    Manifest.permission.ACCESS_FINE_LOCATION,
-                    Manifest.permission.ACCESS_COARSE_LOCATION
-            }, 101);
-        } else {
-            startLocationUpdates();
-        }
-    }
-
-    @Override
-    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
-        if (requestCode == 101) {
-            boolean camGranted = false;
-            for (int i = 0; i < permissions.length; i++) {
-                if (permissions[i].equals(Manifest.permission.CAMERA) && grantResults[i] == PackageManager.PERMISSION_GRANTED) {
-                    camGranted = true;
-                }
-            }
-            startLocationUpdates();
-            if (camGranted && cameraSurface.getHolder().getSurface().isValid()) {
-                startCameraPreview(cameraSurface.getHolder());
-            }
-        }
-    }
-
-    private void startLocationUpdates() {
-        try {
-            if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-                Location last = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
-                if (last == null) last = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
-                if (last != null) {
-                    onNewLocation(last);
-                }
-                LocationListener listener = this::onNewLocation;
-                locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 5000, 5f, listener);
-                locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 5000, 5f, listener);
-            }
-        } catch (Exception ignored) {}
-    }
-
-    private void onNewLocation(Location loc) {
-        latitude = loc.getLatitude();
-        longitude = loc.getLongitude();
-        gpsLocked = true;
-        double distSq = Math.pow((latitude - lastOsmLat) * 111132.0, 2) +
-                        Math.pow((longitude - lastOsmLon) * 65000.0, 2);
-        if (!realOsmLoaded || distSq > 2500.0) {
-            fetchOsmBuildings(latitude, longitude);
-        }
-    }
-
-    @Override
-    protected void onResume() {
-        super.onResume();
-        if (sensorManager != null) {
-            if (rotSensor != null) sensorManager.registerListener(this, rotSensor, SensorManager.SENSOR_DELAY_GAME);
-            if (accelSensor != null) sensorManager.registerListener(this, accelSensor, SensorManager.SENSOR_DELAY_UI);
-            if (pressureSensor != null) sensorManager.registerListener(this, pressureSensor, SensorManager.SENSOR_DELAY_UI);
-            if (lightSensor != null) sensorManager.registerListener(this, lightSensor, SensorManager.SENSOR_DELAY_UI);
-        }
-    }
-
-    @Override
-    protected void onPause() {
-        super.onPause();
-        if (sensorManager != null) sensorManager.unregisterListener(this);
-    }
-
-    @Override
-    public void onSensorChanged(SensorEvent event) {
-        int type = event.sensor.getType();
-        if (type == Sensor.TYPE_ROTATION_VECTOR) {
-            SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values);
-            SensorManager.remapCoordinateSystem(rotationMatrix,
-                    SensorManager.AXIS_X, SensorManager.AXIS_Z, remappedMatrix);
-            SensorManager.getOrientation(remappedMatrix, orientationVals);
-
-            float az = (float) Math.toDegrees(orientationVals[0]);
-            if (az < 0) az += 360f;
-            float alt = (float) -Math.toDegrees(orientationVals[1]);
-            float roll = (float) Math.toDegrees(orientationVals[2]);
-
-            camAzimuth = lowPassAngle(az, camAzimuth, 0.15f);
-            camAltitude = camAltitude + 0.15f * (alt - camAltitude);
-            camRoll = camRoll + 0.15f * (roll - camRoll);
-
-        } else if (type == Sensor.TYPE_ACCELEROMETER) {
-            float gx = event.values[0];
-            float gy = event.values[1];
-            float gz = event.values[2];
-            float pitchDeg = (float) Math.toDegrees(Math.atan2(gy, Math.sqrt(gx * gx + gz * gz)));
-            float rollDeg = (float) Math.toDegrees(Math.atan2(-gx, Math.sqrt(gy * gy + gz * gz)));
-            rawPitch = rawPitch + 0.12f * (pitchDeg - rawPitch);
-            rawRoll = rawRoll + 0.12f * (rollDeg - rawRoll);
-
-        } else if (type == Sensor.TYPE_PRESSURE) {
-            currentPressure = (basePressure < 0) ? event.values[0] : (currentPressure + 0.15f * (event.values[0] - currentPressure));
-            if (basePressure < 0) basePressure = currentPressure;
-
-            float deltaFromBase = 44330f * (1f - (float) Math.pow(currentPressure / basePressure, 0.190295f));
-            relativeHeightMeters = calibratedBaseHeight + deltaFromBase;
-
-        } else if (type == Sensor.TYPE_LIGHT) {
-            currentLux = event.values[0];
-        }
-
-        if (isLiveTime) {
-            syncWithRealTime();
-        }
-        if (overlayView != null) overlayView.invalidate();
-    }
-
-    private float lowPassAngle(float newAngle, float oldAngle, float alpha) {
-        float diff = newAngle - oldAngle;
-        if (diff > 180f) diff -= 360f;
-        if (diff < -180f) diff += 360f;
-        float res = oldAngle + alpha * diff;
-        if (res < 0) res += 360f;
-        if (res >= 360f) res -= 360f;
-        return res;
-    }
-
-    @Override
-    public void onAccuracyChanged(Sensor sensor, int accuracy) {}
-
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
         if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
@@ -1264,10 +1123,13 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                     path.close();
 
                     boolean isUserInside = isPointInPolygon(0f, 0f, b.xMeters, b.yMeters);
+                    boolean blocksSun = doesBuildingBlockSun(b, sunAz, sunAlt);
 
                     paint.setStyle(Paint.Style.FILL);
                     if (isUserInside) {
                         paint.setColor(isLightFieldTheme ? Color.argb(200, 160, 230, 200) : Color.argb(220, 35, 115, 95));
+                    } else if (blocksSun) {
+                        paint.setColor(isLightFieldTheme ? Color.argb(210, 255, 180, 180) : Color.argb(210, 120, 40, 40));
                     } else if (b.heightMeters > relativeHeightMeters + 1.0f) {
                         paint.setColor(isLightFieldTheme ? Color.argb(200, 200, 210, 225) : Color.argb(215, 75, 100, 135));
                     } else {
@@ -1276,8 +1138,8 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                     canvas.drawPath(path, paint);
 
                     paint.setStyle(Paint.Style.STROKE);
-                    paint.setStrokeWidth(isUserInside ? 4f : 2.2f);
-                    paint.setColor(isUserInside ? Color.rgb(0, 180, 100) : (isLightFieldTheme ? Color.rgb(70, 110, 160) : Color.rgb(140, 195, 245)));
+                    paint.setStrokeWidth(isUserInside ? 4f : (blocksSun ? 3.5f : 2.2f));
+                    paint.setColor(blocksSun ? Color.rgb(255, 70, 70) : (isUserInside ? Color.rgb(0, 180, 100) : (isLightFieldTheme ? Color.rgb(70, 110, 160) : Color.rgb(140, 195, 245))));
                     canvas.drawPath(path, paint);
 
                     paint.setStyle(Paint.Style.FILL);
@@ -1377,6 +1239,8 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 canvas.drawCircle(sunX, sunY, 28f, paint);
             }
 
+            drawSmartMiniRadar(canvas, w, curSun[0]);
+
             float calPitch = rawPitch - tarePitch;
             float calRoll = rawRoll - tareRoll;
             float levelRadius = 105f;
@@ -1385,14 +1249,45 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             boolean isLevel = Math.abs(calPitch) < 0.5f && Math.abs(calRoll) < 0.5f;
             paint.setColor(isLevel ? Color.GREEN : (isLightFieldTheme ? Color.BLACK : Color.WHITE));
             canvas.drawCircle(cx, cy, levelRadius, paint);
+            
+            // Исправленная отрисовка осей уровня с правильными 4 координатами
             canvas.drawLine(cx - levelRadius - 20, cy, cx + levelRadius + 20, cy, paint);
-            canvas.drawLine(cx, cy - levelRadius - 20, cx, cy + levelRadius + 20, cy, paint);
+            canvas.drawLine(cx, cy - levelRadius - 20, cx, cy + levelRadius + 20, paint);
 
             float bx = cx + Math.max(-levelRadius, Math.min(levelRadius, (calRoll / 15f) * levelRadius));
             float by = cy + Math.max(-levelRadius, Math.min(levelRadius, (calPitch / 15f) * levelRadius));
             paint.setStyle(Paint.Style.FILL);
             paint.setColor(isLevel ? Color.argb(210, 0, 255, 100) : Color.argb(210, 255, 180, 0));
             canvas.drawCircle(bx, by, 20f, paint);
+        }
+
+        private void drawSmartMiniRadar(Canvas canvas, int w, double sunAz) {
+            float rx = w - 100f;
+            float ry = 440f;
+            float rRad = 65f;
+
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(Color.argb(180, 20, 28, 40));
+            canvas.drawCircle(rx, ry, rRad, paint);
+
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(2.5f);
+            paint.setColor(Color.rgb(0, 230, 180));
+            canvas.drawCircle(rx, ry, rRad, paint);
+
+            paint.setTextSize(18f);
+            paint.setStyle(Paint.Style.FILL);
+            canvas.drawText("N", rx - 6f, ry - rRad + 16f, paint);
+
+            double sunRelAz = sunAz - camAzimuth;
+            double sunRad = Math.toRadians(sunRelAz - 90.0);
+            float sX = rx + (float)(Math.cos(sunRad) * (rRad - 18f));
+            float sY = ry + (float)(Math.sin(sunRad) * (rRad - 18f));
+            paint.setColor(Color.rgb(255, 220, 0));
+            canvas.drawCircle(sX, sY, 8f, paint);
+
+            paint.setColor(Color.rgb(0, 255, 140));
+            canvas.drawCircle(rx, ry, 4f, paint);
         }
 
         private void drawOsmBuildingsInAR(Canvas canvas, int w, int h, float fovH, float fovV) {
@@ -1473,7 +1368,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                     latitude, longitude, gpsText, osmStatus), 38, 352, paint);
 
             paint.setColor(isLightFieldTheme ? Color.rgb(50, 90, 140) : Color.rgb(140, 200, 255));
-            canvas.drawText("DXF/PDF в меню | Тап по зданию = правка этажей", 38, 388, paint);
+            canvas.drawText("DXF/Рулетка в меню | Тап по зданию = этажи", 38, 388, paint);
         }
 
         private void drawSunArc(Canvas canvas, int w, int h, float fovH, float fovV, int day, int color, boolean drawHours) {
