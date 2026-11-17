@@ -5,6 +5,7 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ContentValues;
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -60,8 +61,12 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.TimeZone;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @SuppressWarnings("deprecation")
 public class MainActivity extends Activity implements SensorEventListener, SurfaceHolder.Callback {
@@ -75,25 +80,22 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private AROverlayView overlayView;
     private Button btnModeToggle;
     private TextView timeLabelView;
+    private SeekBar timeSeekBar;
 
-    // Стартовые координаты
-    private double latitude = 54.6195;
+    private double latitude = 54.6194;
     private double longitude = 39.7420;
     private double lastOsmLat = 0.0;
     private double lastOsmLon = 0.0;
     private boolean gpsLocked = false;
     private boolean realOsmLoaded = false;
 
-    // Ориентация камеры (в градусах)
     private float camAzimuth = 0f;
     private float camAltitude = 0f;
     private float camRoll = 0f;
 
-    // Данные цифрового нивелира
     private float rawPitch = 0f, rawRoll = 0f;
     private float tarePitch = 0f, tareRoll = 0f;
 
-    // Барометр, калибровка этажа и люксметр
     private float currentPressure = 1013.25f;
     private float basePressure = -1f;
     private float floorHeightMeters = 3.0f;
@@ -101,12 +103,15 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private float relativeHeightMeters = 12.0f;
     private float currentLux = 0f;
 
-    // Дата и выбранное ползунком время суток
-    private int selectedDayOfYear = 80;
-    private String selectedSeasonLabel = "21 Мар/Сен (СанПиН)";
-    private double selectedSolarHour = 12.5;
+    // Переменные для калькулятора КЕО (СП 52.13330)
+    private float externalLuxForKeo = -1f;
+    private float lastCalculatedKeo = -1f;
 
-    // Режим отображения: false = AR Камера, true = 2D Генплан с тенями
+    private int selectedDayOfYear = 80;
+    private String selectedSeasonLabel = "21 Мар/Сен (Равноденствие)";
+    private double selectedClockHour = 12.0;
+    private boolean isLiveTime = true;
+
     private boolean is2DMapMode = false;
     private float mapScalePixelsPerMeter = 2.2f;
 
@@ -120,7 +125,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
 
     private final List<OsmBuilding> osmBuildings = new ArrayList<>();
     private String osmStatus = "Загрузка домов OSM...";
-    private boolean isFetchingOsm = false;
+    private final AtomicBoolean isFetchingOsm = new AtomicBoolean(false);
 
     private final float[] rotationMatrix = new float[9];
     private final float[] remappedMatrix = new float[9];
@@ -132,10 +137,9 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
 
         Calendar cal = Calendar.getInstance();
         selectedDayOfYear = cal.get(Calendar.DAY_OF_YEAR);
-        selectedSeasonLabel = "Сегодня (день #" + selectedDayOfYear + ")";
-        int hr = cal.get(Calendar.HOUR_OF_DAY);
-        int min = cal.get(Calendar.MINUTE);
-        selectedSolarHour = Math.max(5.0, Math.min(21.0, hr + min / 60.0));
+        selectedSeasonLabel = "День #" + selectedDayOfYear;
+
+        loadCachedOsmIfAvailable();
 
         FrameLayout root = new FrameLayout(this);
 
@@ -145,14 +149,39 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
 
         overlayView = new AROverlayView(this);
         overlayView.setOnTouchListener((v, event) -> {
-            if (is2DMapMode && event.getAction() == MotionEvent.ACTION_DOWN) {
-                if (event.getY() > 420 && event.getY() < v.getHeight() - 260) {
-                    if (mapScalePixelsPerMeter < 1.6f) mapScalePixelsPerMeter = 2.2f;
-                    else if (mapScalePixelsPerMeter < 2.5f) mapScalePixelsPerMeter = 3.5f;
-                    else if (mapScalePixelsPerMeter < 4.0f) mapScalePixelsPerMeter = 5.0f;
-                    else mapScalePixelsPerMeter = 1.2f;
-                    overlayView.invalidate();
-                    Toast.makeText(this, "Масштаб плана изменен", Toast.LENGTH_SHORT).show();
+            if (event.getAction() == MotionEvent.ACTION_DOWN) {
+                float tx = event.getX();
+                float ty = event.getY();
+
+                if (is2DMapMode) {
+                    float cx = v.getWidth() / 2f;
+                    float cy = v.getHeight() * 0.56f;
+                    float mapX = (tx - cx) / mapScalePixelsPerMeter;
+                    float mapY = (cy - ty) / mapScalePixelsPerMeter;
+
+                    synchronized (osmBuildings) {
+                        for (OsmBuilding b : osmBuildings) {
+                            if (isPointInPolygon(mapX, mapY, b.xMeters, b.yMeters)) {
+                                showEditBuildingDialog(b);
+                                return true;
+                            }
+                        }
+                    }
+
+                    if (ty > 430 && ty < v.getHeight() - 260) {
+                        if (mapScalePixelsPerMeter < 1.6f) mapScalePixelsPerMeter = 2.2f;
+                        else if (mapScalePixelsPerMeter < 2.5f) mapScalePixelsPerMeter = 3.5f;
+                        else if (mapScalePixelsPerMeter < 4.0f) mapScalePixelsPerMeter = 5.0f;
+                        else mapScalePixelsPerMeter = 1.2f;
+                        overlayView.invalidate();
+                        Toast.makeText(this, "Масштаб плана изменен", Toast.LENGTH_SHORT).show();
+                        return true;
+                    }
+                } else if (ty < 400 && !realOsmLoaded) {
+                    isFetchingOsm.set(false);
+                    fetchOsmBuildings(latitude, longitude);
+                    Toast.makeText(this, "Повторный запрос к карте OSM...", Toast.LENGTH_SHORT).show();
+                    return true;
                 }
             }
             return false;
@@ -170,28 +199,40 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         sliderRow.setPadding(12, 4, 12, 8);
 
         timeLabelView = new TextView(this);
-        timeLabelView.setTextColor(Color.rgb(255, 225, 90));
-        timeLabelView.setTextSize(13f);
-        timeLabelView.setText(formatSolarHour(selectedSolarHour));
+        timeLabelView.setTextColor(Color.rgb(120, 255, 160));
+        timeLabelView.setTextSize(12.5f);
+        timeLabelView.setOnClickListener(v -> {
+            isLiveTime = true;
+            syncWithRealTime();
+            Toast.makeText(this, "Включено реальное системное время", Toast.LENGTH_SHORT).show();
+        });
         sliderRow.addView(timeLabelView);
 
-        SeekBar timeSeekBar = new SeekBar(this);
-        timeSeekBar.setMax(160);
-        timeSeekBar.setProgress((int) Math.round((selectedSolarHour - 5.0) * 10.0));
+        timeSeekBar = new SeekBar(this);
+        timeSeekBar.setMax(1439);
         LinearLayout.LayoutParams seekParams = new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-        seekParams.setMargins(16, 0, 8, 0);
+        seekParams.setMargins(14, 0, 6, 0);
         timeSeekBar.setLayoutParams(seekParams);
+
+        syncWithRealTime();
+
         timeSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                selectedSolarHour = 5.0 + progress / 10.0;
-                timeLabelView.setText(formatSolarHour(selectedSolarHour));
-                if (overlayView != null) overlayView.invalidate();
+                if (fromUser) {
+                    isLiveTime = false;
+                    selectedClockHour = progress / 60.0;
+                    timeLabelView.setTextColor(Color.rgb(255, 225, 90));
+                    timeLabelView.setText(formatClockHour(selectedClockHour, false));
+                    if (overlayView != null) overlayView.invalidate();
+                }
             }
 
             @Override
-            public void onStartTrackingTouch(SeekBar seekBar) {}
+            public void onStartTrackingTouch(SeekBar seekBar) {
+                isLiveTime = false;
+            }
 
             @Override
             public void onStopTrackingTouch(SeekBar seekBar) {}
@@ -199,6 +240,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         sliderRow.addView(timeSeekBar);
         bottomContainer.addView(sliderRow);
 
+        // Нижняя панель с 6 кнопками (включая КЕО по СП 52.13330)
         LinearLayout bottomBar = new LinearLayout(this);
         bottomBar.setOrientation(LinearLayout.HORIZONTAL);
         bottomBar.setGravity(Gravity.CENTER);
@@ -207,14 +249,14 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         btnModeToggle.setOnClickListener(v -> {
             is2DMapMode = !is2DMapMode;
             btnModeToggle.setText(is2DMapMode ? "Камера AR" : "2D План");
-            if (!realOsmLoaded && !isFetchingOsm) {
+            if (!realOsmLoaded) {
                 fetchOsmBuildings(latitude, longitude);
             }
             overlayView.invalidate();
         });
 
-        Button btnSeason = createButton("Дата", Color.argb(210, 45, 65, 95));
-        btnSeason.setOnClickListener(v -> cycleSeason());
+        Button btnKeo = createButton("КЕО СП52", Color.argb(230, 160, 50, 180));
+        btnKeo.setOnClickListener(v -> showKeoCalculatorDialog());
 
         Button btnTare = createButton("Тара 0°", Color.argb(210, 45, 65, 95));
         btnTare.setOnClickListener(v -> {
@@ -233,7 +275,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         btnSave.setOnClickListener(v -> exportLogToCsv());
 
         bottomBar.addView(btnModeToggle);
-        bottomBar.addView(btnSeason);
+        bottomBar.addView(btnKeo);
         bottomBar.addView(btnTare);
         bottomBar.addView(btnZeroAlt);
         bottomBar.addView(btnPhoto);
@@ -264,73 +306,176 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         fetchOsmBuildings(latitude, longitude);
     }
 
-    private String formatSolarHour(double sh) {
-        int h = (int) sh;
-        int m = (int) Math.round((sh - h) * 60.0);
-        if (m == 60) { h++; m = 0; }
-        return String.format(Locale.US, "Время: %02d:%02d", h, m);
+    private void showKeoCalculatorDialog() {
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle("Калькулятор КЕО (СП 52.13330)");
+
+        String extText = (externalLuxForKeo > 0) ? String.format(Locale.US, "%.0f лк", externalLuxForKeo) : "не задано (выйдите на улицу)";
+        String curText = String.format(Locale.US, "%.0f лк", currentLux);
+        String lastRes = (lastCalculatedKeo > 0) ? String.format(Locale.US, "Последний расчет: %.2f%%", lastCalculatedKeo) : "Расчетов еще не было";
+
+        builder.setMessage("Текущий свет в помещении: " + curText + "\n" +
+                "Наружный свет (улица): " + extText + "\n\n" +
+                lastRes + "\n\n" +
+                "Норма КЕО для жилых комнат (боковое): ≥ 0.5% – 1.0%");
+
+        builder.setPositiveButton("1. Запомнить улицу (E_нар)", (dialog, which) -> {
+            externalLuxForKeo = currentLux;
+            Toast.makeText(this, "Наружный свет сохранен: " + externalLuxForKeo + " лк", Toast.LENGTH_LONG).show();
+        });
+
+        builder.setNeutralButton("2. Расчет КЕО (%)", (dialog, which) -> {
+            if (externalLuxForKeo <= 0) {
+                Toast.makeText(this, "Сначала запомните наружный свет на улице!", Toast.LENGTH_LONG).show();
+                return;
+            }
+            lastCalculatedKeo = (currentLux / externalLuxForKeo) * 100.0f;
+            boolean pass = lastCalculatedKeo >= 0.5f;
+            String status = pass ? "НОРМА (≥0.5%)" : "НИЖЕ НОРМЫ (<0.5%)";
+            Toast.makeText(this, String.format(Locale.US, "КЕО = %.2f%% [%s]", lastCalculatedKeo, status), Toast.LENGTH_LONG).show();
+            if (overlayView != null) overlayView.invalidate();
+        });
+
+        builder.setNegativeButton("Закрыть", null);
+        builder.show();
+    }
+
+    private void showEditBuildingDialog(OsmBuilding b) {
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(50, 30, 50, 10);
+
+        final EditText inputLevels = new EditText(this);
+        inputLevels.setHint("Количество этажей");
+        inputLevels.setInputType(InputType.TYPE_CLASS_NUMBER);
+        inputLevels.setText(String.valueOf(b.levels));
+        layout.addView(inputLevels);
+
+        String title = "Здание " + (b.houseNumber != null && !b.houseNumber.isEmpty() ? "д." + b.houseNumber : "выбрано");
+        new AlertDialog.Builder(this)
+                .setTitle(title)
+                .setMessage("Измените этажность для пересчета тени на этаж:")
+                .setView(layout)
+                .setPositiveButton("Сохранить", (dialog, which) -> {
+                    try {
+                        int lvl = Integer.parseInt(inputLevels.getText().toString().trim());
+                        if (lvl > 0) {
+                            b.levels = lvl;
+                            b.heightMeters = lvl * 3.0f;
+                            if (overlayView != null) overlayView.invalidate();
+                            Toast.makeText(this, "Высота обновлена: " + lvl + " эт (" + b.heightMeters + "м)", Toast.LENGTH_SHORT).show();
+                        }
+                    } catch (Exception ignored) {}
+                })
+                .setNegativeButton("Отмена", null)
+                .show();
+    }
+
+    private void syncWithRealTime() {
+        Calendar cal = Calendar.getInstance();
+        int hr = cal.get(Calendar.HOUR_OF_DAY);
+        int min = cal.get(Calendar.MINUTE);
+        int sec = cal.get(Calendar.SECOND);
+        selectedClockHour = hr + (min / 60.0) + (sec / 3600.0);
+
+        if (timeSeekBar != null) {
+            timeSeekBar.setProgress(hr * 60 + min);
+        }
+        if (timeLabelView != null) {
+            timeLabelView.setTextColor(Color.rgb(120, 255, 160));
+            timeLabelView.setText(String.format(Locale.US, "Сейчас: %02d:%02d:%02d", hr, min, sec));
+        }
+    }
+
+    private String formatClockHour(double ch, boolean live) {
+        int totalMin = (int) Math.round(ch * 60.0);
+        if (totalMin < 0) totalMin = 0;
+        if (totalMin > 1439) totalMin = 1439;
+        int h = totalMin / 60;
+        int m = totalMin % 60;
+        return String.format(Locale.US, "%s: %02d:%02d", live ? "Сейчас" : "Ручн (сброс)", h, m);
     }
 
     private Button createButton(String text, int bgColor) {
         Button b = new Button(this);
         b.setText(text);
-        b.setTextSize(10.5f);
+        b.setTextSize(10.0f);
         b.setTextColor(Color.WHITE);
         b.setBackgroundColor(bgColor);
-        b.setPadding(4, 12, 4, 12);
+        b.setPadding(2, 12, 2, 12);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-        lp.setMargins(3, 0, 3, 0);
+        lp.setMargins(2, 0, 2, 0);
         b.setLayoutParams(lp);
         return b;
     }
 
-    // Загрузка реальных зданий из OpenStreetMap без заголовка, вызывавшего HTTP 406
-    private void fetchOsmBuildings(final double lat, final double lon) {
-        if (isFetchingOsm) return;
+    private void loadCachedOsmIfAvailable() {
+        try {
+            SharedPreferences prefs = getSharedPreferences("osm_cache_v2", MODE_PRIVATE);
+            String cachedJson = prefs.getString("json", null);
+            double cLat = Double.longBitsToDouble(prefs.getLong("lat", 0));
+            double cLon = Double.longBitsToDouble(prefs.getLong("lon", 0));
+            if (cachedJson != null && Math.abs(cLat - latitude) < 0.01 && Math.abs(cLon - longitude) < 0.01) {
+                int count = parseOsmJson(cachedJson, latitude, longitude);
+                if (count > 0) {
+                    realOsmLoaded = true;
+                    lastOsmLat = cLat;
+                    lastOsmLon = cLon;
+                    osmStatus = "Карта OSM (кэш): " + count + " домов";
+                }
+            }
+        } catch (Exception ignored) {}
+    }
 
-        if (checkSelfPermission(Manifest.permission.INTERNET) != PackageManager.PERMISSION_GRANTED) {
-            osmStatus = "Нет разрешения INTERNET в AndroidManifest";
+    private void saveOsmCache(String json, double lat, double lon) {
+        try {
+            SharedPreferences prefs = getSharedPreferences("osm_cache_v2", MODE_PRIVATE);
+            prefs.edit()
+                    .putString("json", json)
+                    .putLong("lat", Double.doubleToRawLongBits(lat))
+                    .putLong("lon", Double.doubleToRawLongBits(lon))
+                    .apply();
+        } catch (Exception ignored) {}
+    }
+
+    private void fetchOsmBuildings(final double lat, final double lon) {
+        if (!isFetchingOsm.compareAndSet(false, true)) return;
+
+        if (!realOsmLoaded) {
+            osmStatus = "Загрузка домов из OSM...";
             if (overlayView != null) overlayView.postInvalidate();
-            return;
         }
 
-        isFetchingOsm = true;
-        osmStatus = "Загрузка реальных домов из OSM...";
-        if (overlayView != null) overlayView.postInvalidate();
-
         new Thread(() -> {
+            double south = lat - 0.0024;
+            double north = lat + 0.0024;
+            double west = lon - 0.0038;
+            double east = lon + 0.0038;
+
+            String query = String.format(Locale.US,
+                    "[out:json][timeout:12];(way[\"building\"](%.5f,%.5f,%.5f,%.5f);>;);out body;",
+                    south, west, north, east);
+
             String[] endpoints = new String[]{
+                    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
                     "https://overpass-api.de/api/interpreter",
                     "https://lz4.overpass-api.de/api/interpreter",
-                    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
-                    "https://overpass.private.coffee/api/interpreter"
+                    "https://overpass.kumi.systems/api/interpreter"
             };
-            String query = String.format(Locale.US,
-                    "[out:json][timeout:15];(way[\"building\"](around:260,%.5f,%.5f);relation[\"building\"](around:260,%.5f,%.5f););out body geom;",
-                    lat, lon, lat, lon);
 
             boolean success = false;
-            String lastErr = "";
+            StringBuilder errLog = new StringBuilder();
 
             for (String endpoint : endpoints) {
                 HttpURLConnection conn = null;
                 try {
-                    // Используем POST с универсальным Accept: */*, чтобы исключить ошибку HTTP 406
-                    URL url = new URL(endpoint);
+                    String urlStr = endpoint + "?data=" + URLEncoder.encode(query, "UTF-8");
+                    URL url = new URL(urlStr);
                     conn = (HttpURLConnection) url.openConnection();
-                    conn.setRequestMethod("POST");
-                    conn.setDoOutput(true);
-                    conn.setConnectTimeout(8000);
-                    conn.setReadTimeout(12000);
-                    conn.setRequestProperty("User-Agent", "SunLevelBIM/1.2");
-                    conn.setRequestProperty("Accept", "*/*");
-                    conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
-
-                    String postBody = "data=" + URLEncoder.encode(query, "UTF-8");
-                    OutputStream os = conn.getOutputStream();
-                    os.write(postBody.getBytes(StandardCharsets.UTF_8));
-                    os.flush();
-                    os.close();
+                    conn.setRequestMethod("GET");
+                    conn.setConnectTimeout(6000);
+                    conn.setReadTimeout(8000);
+                    conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14)");
 
                     int code = conn.getResponseCode();
                     if (code == 200) {
@@ -343,34 +488,38 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                         }
                         reader.close();
 
-                        int count = parseOsmJson(sb.toString(), lat, lon);
+                        String jsonStr = sb.toString();
+                        int count = parseOsmJson(jsonStr, lat, lon);
                         if (count > 0) {
                             lastOsmLat = lat;
                             lastOsmLon = lon;
                             realOsmLoaded = true;
+                            saveOsmCache(jsonStr, lat, lon);
                             success = true;
                             break;
                         } else {
-                            lastErr = "0 домов в радиусе 260м";
+                            errLog.append("0д ");
                         }
                     } else {
-                        lastErr = "HTTP " + code;
+                        errLog.append("HTTP").append(code).append(" ");
                     }
                 } catch (Exception e) {
-                    lastErr = e.getClass().getSimpleName();
+                    String name = e.getClass().getSimpleName().replace("Exception", "");
+                    errLog.append(name).append(" ");
                 } finally {
                     if (conn != null) conn.disconnect();
                 }
             }
 
             final boolean ok = success;
-            final String errInfo = lastErr;
+            final String errStr = errLog.toString().trim();
+            isFetchingOsm.set(false);
+
             runOnUiThread(() -> {
-                isFetchingOsm = false;
                 if (ok) {
                     osmStatus = "Карта OSM: " + osmBuildings.size() + " реальных домов";
-                } else {
-                    osmStatus = "Ошибка OSM (" + errInfo + ") — нажмите Этаж/0м";
+                } else if (!realOsmLoaded) {
+                    osmStatus = "Сбой сети (" + errStr + ") — нажмите сюда";
                 }
                 if (overlayView != null) overlayView.invalidate();
             });
@@ -382,12 +531,29 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         JSONArray elements = root.optJSONArray("elements");
         if (elements == null) return 0;
 
-        List<OsmBuilding> parsed = new ArrayList<>();
         double metersPerDegLat = 111132.0;
         double metersPerDegLon = 111320.0 * Math.cos(Math.toRadians(centerLat));
 
+        Map<Long, float[]> nodeMap = new HashMap<>();
         for (int i = 0; i < elements.length(); i++) {
             JSONObject el = elements.getJSONObject(i);
+            if ("node".equals(el.optString("type"))) {
+                long id = el.getLong("id");
+                double ptLat = el.getDouble("lat");
+                double ptLon = el.getDouble("lon");
+                float xm = (float) ((ptLon - centerLon) * metersPerDegLon);
+                float ym = (float) ((ptLat - centerLat) * metersPerDegLat);
+                nodeMap.put(id, new float[]{xm, ym});
+            }
+        }
+
+        List<OsmBuilding> parsed = new ArrayList<>();
+        for (int i = 0; i < elements.length(); i++) {
+            JSONObject el = elements.getJSONObject(i);
+            if (!"way".equals(el.optString("type")) && el.optJSONArray("geometry") == null) {
+                continue;
+            }
+
             int levels = -1;
             float height = -1f;
             String houseNum = "";
@@ -409,31 +575,51 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 }
             }
 
-            // Если в OSM не указана этажность конкретного дома, берем 5 этажей по умолчанию
             if (levels <= 0 && height > 2f) {
                 levels = Math.max(1, Math.round(height / 3.0f));
             }
             if (levels <= 0) levels = 5;
             if (height <= 2f) height = levels * 3.0f;
 
+            JSONArray nodesArr = el.optJSONArray("nodes");
+            if (nodesArr != null && nodesArr.length() >= 3 && !nodeMap.isEmpty()) {
+                List<float[]> pts = new ArrayList<>();
+                for (int j = 0; j < nodesArr.length(); j++) {
+                    float[] xy = nodeMap.get(nodesArr.getLong(j));
+                    if (xy != null) pts.add(xy);
+                }
+                if (pts.size() >= 3) {
+                    OsmBuilding b = new OsmBuilding();
+                    b.xMeters = new float[pts.size()];
+                    b.yMeters = new float[pts.size()];
+                    for (int j = 0; j < pts.size(); j++) {
+                        b.xMeters[j] = pts.get(j)[0];
+                        b.yMeters[j] = pts.get(j)[1];
+                    }
+                    b.levels = levels;
+                    b.heightMeters = height;
+                    b.houseNumber = houseNum;
+                    parsed.add(b);
+                    continue;
+                }
+            }
+
             JSONArray geom = el.optJSONArray("geometry");
             if (geom != null && geom.length() >= 3) {
-                OsmBuilding b = buildFromGeomArray(geom, centerLat, centerLon, metersPerDegLat, metersPerDegLon, levels, height, houseNum);
-                if (b != null) parsed.add(b);
-            } else {
-                JSONArray members = el.optJSONArray("members");
-                if (members != null) {
-                    for (int m = 0; m < members.length(); m++) {
-                        JSONObject mem = members.getJSONObject(m);
-                        if ("outer".equals(mem.optString("role", "outer"))) {
-                            JSONArray mGeom = mem.optJSONArray("geometry");
-                            if (mGeom != null && mGeom.length() >= 3) {
-                                OsmBuilding b = buildFromGeomArray(mGeom, centerLat, centerLon, metersPerDegLat, metersPerDegLon, levels, height, houseNum);
-                                if (b != null) parsed.add(b);
-                            }
-                        }
-                    }
+                OsmBuilding b = new OsmBuilding();
+                b.xMeters = new float[geom.length()];
+                b.yMeters = new float[geom.length()];
+                for (int j = 0; j < geom.length(); j++) {
+                    JSONObject pt = geom.getJSONObject(j);
+                    double ptLat = pt.getDouble("lat");
+                    double ptLon = pt.getDouble("lon");
+                    b.xMeters[j] = (float) ((ptLon - centerLon) * metersPerDegLon);
+                    b.yMeters[j] = (float) ((ptLat - centerLat) * metersPerDegLat);
                 }
+                b.levels = levels;
+                b.heightMeters = height;
+                b.houseNumber = houseNum;
+                parsed.add(b);
             }
         }
 
@@ -444,29 +630,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             }
         }
         return parsed.size();
-    }
-
-    private OsmBuilding buildFromGeomArray(JSONArray geom, double centerLat, double centerLon,
-                                           double metersPerDegLat, double metersPerDegLon,
-                                           int levels, float height, String houseNum) {
-        try {
-            OsmBuilding b = new OsmBuilding();
-            b.xMeters = new float[geom.length()];
-            b.yMeters = new float[geom.length()];
-            for (int j = 0; j < geom.length(); j++) {
-                JSONObject pt = geom.getJSONObject(j);
-                double ptLat = pt.getDouble("lat");
-                double ptLon = pt.getDouble("lon");
-                b.xMeters[j] = (float) ((ptLon - centerLon) * metersPerDegLon);
-                b.yMeters[j] = (float) ((ptLat - centerLat) * metersPerDegLat);
-            }
-            b.levels = levels;
-            b.heightMeters = height;
-            b.houseNumber = houseNum;
-            return b;
-        } catch (Exception e) {
-            return null;
-        }
     }
 
     private void showAltitudeCalibrationDialog() {
@@ -503,7 +666,10 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                                 Toast.LENGTH_SHORT).show();
                     } catch (Exception ignored) {}
                 })
-                .setNeutralButton("Обновить дома OSM", (dialog, which) -> fetchOsmBuildings(latitude, longitude))
+                .setNeutralButton("Обновить дома OSM", (dialog, which) -> {
+                    isFetchingOsm.set(false);
+                    fetchOsmBuildings(latitude, longitude);
+                })
                 .setNegativeButton("Отмена", null)
                 .show();
     }
@@ -567,7 +733,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             stampPaint.setColor(Color.rgb(255, 220, 90));
             stampPaint.setTextSize(28f);
             String timeStamp = new SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.US).format(new Date());
-            comboCanvas.drawText("ШТАМП ФИКСАЦИИ: " + timeStamp + " | " + formatSolarHour(selectedSolarHour), 40, targetH - 178, stampPaint);
+            comboCanvas.drawText("ШТАМП ФИКСАЦИИ: " + timeStamp + " | " + formatClockHour(selectedClockHour, isLiveTime), 40, targetH - 178, stampPaint);
 
             String fileName = "BIM_AR_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date()) + ".jpg";
             ContentValues values = new ContentValues();
@@ -719,6 +885,9 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             currentLux = event.values[0];
         }
 
+        if (isLiveTime) {
+            syncWithRealTime();
+        }
         if (overlayView != null) overlayView.invalidate();
     }
 
@@ -735,11 +904,17 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     @Override
     public void onAccuracyChanged(Sensor sensor, int accuracy) {}
 
-    private double[] computeSunPosition(double latDeg, int dayOfYear, double solarHour) {
+    private double[] computeSunPosition(double latDeg, int dayOfYear, double localClockHour) {
+        double tzHours = TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 3600000.0;
+        double bRad = Math.toRadians((360.0 / 365.0) * (dayOfYear - 81));
+        double eotMinutes = 9.87 * Math.sin(2.0 * bRad) - 7.53 * Math.cos(bRad) - 1.5 * Math.sin(bRad);
+        double timeCorrectionMinutes = 4.0 * (longitude - 15.0 * tzHours) + eotMinutes;
+        double trueSolarHour = localClockHour + (timeCorrectionMinutes / 60.0);
+
         double latRad = Math.toRadians(latDeg);
         double declDeg = 23.45 * Math.sin(Math.toRadians((360.0 / 365.0) * (284 + dayOfYear)));
         double declRad = Math.toRadians(declDeg);
-        double hourAngleRad = Math.toRadians(15.0 * (solarHour - 12.0));
+        double hourAngleRad = Math.toRadians(15.0 * (trueSolarHour - 12.0));
 
         double sinAlt = Math.sin(latRad) * Math.sin(declRad) +
                         Math.cos(latRad) * Math.cos(declRad) * Math.cos(hourAngleRad);
@@ -750,7 +925,9 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                        (Math.cos(altRad) * Math.cos(latRad) + 1e-6);
         cosAz = Math.max(-1.0, Math.min(1.0, cosAz));
         double azDeg = Math.toDegrees(Math.acos(cosAz));
-        if (solarHour > 12.0) azDeg = 360.0 - azDeg;
+
+        double normSolar = ((trueSolarHour % 24.0) + 24.0) % 24.0;
+        if (normSolar > 12.0) azDeg = 360.0 - azDeg;
 
         return new double[]{azDeg, Math.toDegrees(altRad)};
     }
@@ -815,16 +992,16 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
 
             FileWriter fw = new FileWriter(file, true);
             if (isNew) {
-                fw.append("Timestamp,Lat,Lon,CamAzimuth_deg,CamAltitude_deg,SlopePitch_deg,Slope_mm_per_m,Lux,DeltaHeight_m,EstFloor,SolarHour\n");
+                fw.append("Timestamp,Lat,Lon,CamAzimuth_deg,CamAltitude_deg,SlopePitch_deg,Slope_mm_per_m,Lux,KEO_percent,DeltaHeight_m,EstFloor,ClockHour\n");
             }
             String ts = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date());
             float calPitch = rawPitch - tarePitch;
             float mmPerMeter = (float) (Math.tan(Math.toRadians(Math.abs(calPitch))) * 1000.0);
             int estFloor = Math.round(relativeHeightMeters / floorHeightMeters) + 1;
 
-            fw.append(String.format(Locale.US, "%s,%.5f,%.5f,%.1f,%.1f,%.2f,%.1f,%.0f,%.2f,%d,%.1f\n",
+            fw.append(String.format(Locale.US, "%s,%.5f,%.5f,%.1f,%.1f,%.2f,%.1f,%.0f,%.2f,%.2f,%d,%.2f\n",
                     ts, latitude, longitude, camAzimuth, camAltitude, calPitch, mmPerMeter,
-                    currentLux, relativeHeightMeters, estFloor, selectedSolarHour));
+                    currentLux, lastCalculatedKeo, relativeHeightMeters, estFloor, selectedClockHour));
             fw.flush();
             fw.close();
             Toast.makeText(this, "Сохранено в Download/BIM_Field_Log.csv", Toast.LENGTH_LONG).show();
@@ -913,7 +1090,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 paint.setStyle(Paint.Style.STROKE);
             }
 
-            // Подписи сторон света по краям 2D-генплана
             paint.setStyle(Paint.Style.FILL);
             paint.setColor(Color.rgb(0, 230, 180));
             paint.setTextSize(26f);
@@ -922,13 +1098,12 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             canvas.drawText("З", 20, cy - 10, paint);
             canvas.drawText("В", w - 40, cy - 10, paint);
 
-            // Зеленый сектор взгляда камеры
             paint.setColor(Color.argb(45, 0, 255, 180));
             RectF fovRect = new RectF(cx - 120 * scale, cy - 120 * scale, cx + 120 * scale, cy + 120 * scale);
             float startAngle2D = camAzimuth - 90f - 30f;
             canvas.drawArc(fovRect, startAngle2D, 60f, true, paint);
 
-            double[] sunPos = computeSunPosition(latitude, selectedDayOfYear, selectedSolarHour);
+            double[] sunPos = computeSunPosition(latitude, selectedDayOfYear, selectedClockHour);
             double sunAz = sunPos[0];
             double sunAlt = sunPos[1];
 
@@ -987,7 +1162,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                     paint.setColor(isUserInside ? Color.rgb(0, 255, 160) : Color.rgb(140, 195, 245));
                     canvas.drawPath(path, paint);
 
-                    // Подпись реального номера дома и этажности из OSM
                     paint.setStyle(Paint.Style.FILL);
                     paint.setColor(Color.WHITE);
                     paint.setTextSize(19f);
@@ -1019,10 +1193,10 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             canvas.drawCircle(cx, cy, 12f, paint);
 
             paint.setColor(Color.LTGRAY);
-            paint.setTextSize(24f);
+            paint.setTextSize(23f);
             String shadowStatus = (sunAlt <= 0) ? "Ночь (Солнце за горизонтом)" :
                     (inShadowNow ? "В ТЕНИ соседнего дома (на отм. этажа)" : "ПРЯМОЕ СОЛНЦЕ (тень мимо этажа)");
-            canvas.drawText(shadowStatus, 30, h - 190, paint);
+            canvas.drawText(shadowStatus, 25, h - 190, paint);
         }
 
         private void drawBuildingShadow(Canvas canvas, OsmBuilding b, float cx, float cy, float scale, float offX, float offY) {
@@ -1069,7 +1243,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             drawSunArc(canvas, w, h, fovH, fovV, 172, Color.argb(140, 255, 120, 80), false);
             drawSunArc(canvas, w, h, fovH, fovV, selectedDayOfYear, Color.rgb(255, 230, 0), true);
 
-            double[] curSun = computeSunPosition(latitude, selectedDayOfYear, selectedSolarHour);
+            double[] curSun = computeSunPosition(latitude, selectedDayOfYear, selectedClockHour);
             if (curSun[1] > -5.0) {
                 float sunX = azimuthToScreenX((float) curSun[0], w, fovH);
                 float sunY = cy - (((float) curSun[1] - camAltitude) / fovV) * h;
@@ -1138,13 +1312,13 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         private void drawTelemetryHeader(Canvas canvas, int w) {
             paint.setStyle(Paint.Style.FILL);
             paint.setColor(Color.argb(195, 15, 20, 28));
-            canvas.drawRoundRect(new RectF(18, 25, w - 18, 385), 22f, 22f, paint);
+            canvas.drawRoundRect(new RectF(18, 25, w - 18, 400), 22f, 22f, paint);
 
-            double[] curSun = computeSunPosition(latitude, selectedDayOfYear, selectedSolarHour);
+            double[] curSun = computeSunPosition(latitude, selectedDayOfYear, selectedClockHour);
             paint.setColor(Color.WHITE);
-            paint.setTextSize(31f);
+            paint.setTextSize(30f);
             canvas.drawText(String.format(Locale.US, "Азимут: %.1f° (%s) | Солнце: Аз %.0f° Выс %.0f°",
-                    camAzimuth, getCardinal(camAzimuth), curSun[0], curSun[1]), 38, 72, paint);
+                    camAzimuth, getCardinal(camAzimuth), curSun[0], curSun[1]), 38, 68, paint);
 
             float calPitch = rawPitch - tarePitch;
             float calRoll = rawRoll - tareRoll;
@@ -1153,31 +1327,35 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             float slopeMmM = slopePercent * 10f;
             paint.setColor(isLevel ? Color.GREEN : Color.rgb(255, 215, 80));
             canvas.drawText(String.format(Locale.US, "Уклон: %.1f° | %.1f%% | %.0f мм/м (Крен: %.1f°)",
-                    calPitch, slopePercent, slopeMmM, calRoll), 38, 124, paint);
+                    calPitch, slopePercent, slopeMmM, calRoll), 38, 118, paint);
 
             int estFloor = Math.round(relativeHeightMeters / floorHeightMeters) + 1;
             paint.setColor(Color.rgb(130, 220, 255));
             canvas.drawText(String.format(Locale.US, "Отметка H: %+.2f м (~%d эт.) | %.1f гПа",
-                    relativeHeightMeters, estFloor, currentPressure), 38, 176, paint);
+                    relativeHeightMeters, estFloor, currentPressure), 38, 168, paint);
 
             paint.setColor(Color.rgb(200, 255, 160));
-            canvas.drawText(String.format(Locale.US, "Свет: %.0f лк (%s)",
-                    currentLux, evaluateLuxNorm(currentLux)), 38, 228, paint);
+            canvas.drawText(String.format(Locale.US, "Свет: %.0f лк (%s) | КЕО: %s",
+                    currentLux, evaluateLuxNorm(currentLux), lastCalculatedKeo > 0 ? String.format(Locale.US, "%.2f%%", lastCalculatedKeo) : "не замер."), 38, 218, paint);
 
             float[] insolHours = calculateInsolationWithOsm(latitude, selectedDayOfYear);
-            paint.setColor(Color.rgb(255, 230, 100));
-            canvas.drawText(String.format(Locale.US, "%s: %.1f ч (без тени домов: %.1f ч)",
-                    selectedSeasonLabel, insolHours[0], insolHours[1]), 38, 280, paint);
+            boolean sanPinPassed = insolHours[1] >= 2.0f;
+            paint.setColor(sanPinPassed ? Color.rgb(120, 255, 160) : Color.rgb(255, 100, 100));
+            canvas.drawText(String.format(Locale.US, "СанПиН: %s (%.1f ч без тени)",
+                    sanPinPassed ? "СОБЛЮДЕНА (≥2ч)" : "НАРУШЕНИЕ (<2ч)", insolHours[1]), 38, 268, paint);
 
-            paint.setTextSize(25f);
+            paint.setColor(Color.rgb(255, 230, 100));
+            paint.setTextSize(27f);
+            canvas.drawText(String.format(Locale.US, "%s | Астрон. свет: %.1f ч", selectedSeasonLabel, insolHours[0]), 38, 312, paint);
+
+            paint.setTextSize(24f);
             paint.setColor(realOsmLoaded ? Color.rgb(120, 255, 160) : Color.rgb(255, 180, 100));
             String gpsText = gpsLocked ? "GPS" : "Старт";
             canvas.drawText(String.format(Locale.US, "%.4f N, %.4f E [%s] | %s",
-                    latitude, longitude, gpsText, osmStatus), 38, 330, paint);
+                    latitude, longitude, gpsText, osmStatus), 38, 352, paint);
 
             paint.setColor(Color.rgb(140, 200, 255));
-            canvas.drawText(is2DMapMode ? "Режим: 2D Генплан теней (нажмите на карту для зума)" :
-                    "Режим: Камера AR (красный кружок на дуге = тень от дома)", 38, 368, paint);
+            canvas.drawText("Тап по зданию = правка этажей | Кнопка КЕО СП52", 38, 388, paint);
         }
 
         private void drawSunArc(Canvas canvas, int w, int h, float fovH, float fovV, int day, int color, boolean drawHours) {
@@ -1187,7 +1365,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             path.reset();
             boolean started = false;
 
-            for (double hr = 5.0; hr <= 21.0; hr += 0.5) {
+            for (double hr = 4.0; hr <= 22.0; hr += 0.5) {
                 double[] pos = computeSunPosition(latitude, day, hr);
                 if (pos[1] < -5.0) continue;
 
@@ -1242,7 +1420,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         private float[] calculateInsolationWithOsm(double lat, int day) {
             float astroHours = 0f;
             float unblockedHours = 0f;
-            for (double hr = 4.5; hr <= 21.5; hr += 0.25) {
+            for (double hr = 4.0; hr <= 22.0; hr += 0.25) {
                 double[] pos = computeSunPosition(lat, day, hr);
                 if (pos[1] > 0.0) {
                     astroHours += 0.25f;
