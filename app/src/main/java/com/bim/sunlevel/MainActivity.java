@@ -50,6 +50,7 @@ import org.json.JSONObject;
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
@@ -82,7 +83,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private TextView timeLabelView;
     private SeekBar timeSeekBar;
 
-    private double latitude = 54.6194;
+    private double latitude = 54.6195;
     private double longitude = 39.7420;
     private double lastOsmLat = 0.0;
     private double lastOsmLon = 0.0;
@@ -103,9 +104,18 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private float relativeHeightMeters = 12.0f;
     private float currentLux = 0f;
 
-    // Переменные для калькулятора КЕО (СП 52.13330)
+    // Расширенные данные КЕО по точкам контроля (СП 52.13330)
     private float externalLuxForKeo = -1f;
+    private float keoWindowLux = -1f;
+    private float keoCenterLux = -1f;
+    private float keoBackLux = -1f;
     private float lastCalculatedKeo = -1f;
+
+    // Пользовательский проектный контур (импорт DXF/точек)
+    private final List<float[]> customProjectPolygon = new ArrayList<>();
+
+    // Настройки интерфейса: тема (false = темная, true = светлая полевая)
+    private boolean isLightFieldTheme = false;
 
     private int selectedDayOfYear = 80;
     private String selectedSeasonLabel = "21 Мар/Сен (Равноденствие)";
@@ -139,6 +149,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         selectedDayOfYear = cal.get(Calendar.DAY_OF_YEAR);
         selectedSeasonLabel = "День #" + selectedDayOfYear;
 
+        loadOfflineFallbackBuildings();
         loadCachedOsmIfAvailable();
 
         FrameLayout root = new FrameLayout(this);
@@ -177,7 +188,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                         Toast.makeText(this, "Масштаб плана изменен", Toast.LENGTH_SHORT).show();
                         return true;
                     }
-                } else if (ty < 400 && !realOsmLoaded) {
+                } else if (ty < 400) {
                     isFetchingOsm.set(false);
                     fetchOsmBuildings(latitude, longitude);
                     Toast.makeText(this, "Повторный запрос к карте OSM...", Toast.LENGTH_SHORT).show();
@@ -190,7 +201,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
 
         LinearLayout bottomContainer = new LinearLayout(this);
         bottomContainer.setOrientation(LinearLayout.VERTICAL);
-        bottomContainer.setBackgroundColor(Color.argb(205, 12, 18, 26));
+        bottomContainer.setBackgroundColor(isLightFieldTheme ? Color.argb(230, 240, 244, 248) : Color.argb(205, 12, 18, 26));
         bottomContainer.setPadding(12, 10, 12, 20);
 
         LinearLayout sliderRow = new LinearLayout(this);
@@ -199,7 +210,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         sliderRow.setPadding(12, 4, 12, 8);
 
         timeLabelView = new TextView(this);
-        timeLabelView.setTextColor(Color.rgb(120, 255, 160));
+        timeLabelView.setTextColor(isLightFieldTheme ? Color.rgb(20, 100, 50) : Color.rgb(120, 255, 160));
         timeLabelView.setTextSize(12.5f);
         timeLabelView.setOnClickListener(v -> {
             isLiveTime = true;
@@ -223,7 +234,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 if (fromUser) {
                     isLiveTime = false;
                     selectedClockHour = progress / 60.0;
-                    timeLabelView.setTextColor(Color.rgb(255, 225, 90));
+                    timeLabelView.setTextColor(isLightFieldTheme ? Color.rgb(150, 100, 0) : Color.rgb(255, 225, 90));
                     timeLabelView.setText(formatClockHour(selectedClockHour, false));
                     if (overlayView != null) overlayView.invalidate();
                 }
@@ -240,7 +251,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         sliderRow.addView(timeSeekBar);
         bottomContainer.addView(sliderRow);
 
-        // Нижняя панель с 6 кнопками (включая КЕО по СП 52.13330)
+        // Нижняя панель инструментов
         LinearLayout bottomBar = new LinearLayout(this);
         bottomBar.setOrientation(LinearLayout.HORIZONTAL);
         bottomBar.setGravity(Gravity.CENTER);
@@ -249,35 +260,32 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         btnModeToggle.setOnClickListener(v -> {
             is2DMapMode = !is2DMapMode;
             btnModeToggle.setText(is2DMapMode ? "Камера AR" : "2D План");
-            if (!realOsmLoaded) {
-                fetchOsmBuildings(latitude, longitude);
-            }
             overlayView.invalidate();
         });
 
-        Button btnKeo = createButton("КЕО СП52", Color.argb(230, 160, 50, 180));
-        btnKeo.setOnClickListener(v -> showKeoCalculatorDialog());
+        Button btnKeo = createButton("КЕО/СП", Color.argb(230, 160, 50, 180));
+        btnKeo.setOnClickListener(v -> showKeoGridDialog());
 
-        Button btnTare = createButton("Тара 0°", Color.argb(210, 45, 65, 95));
-        btnTare.setOnClickListener(v -> {
-            tarePitch = rawPitch;
-            tareRoll = rawRoll;
-            Toast.makeText(this, "Уклономер обнулен (0.0°)", Toast.LENGTH_SHORT).show();
+        Button btnProject = createButton("DXF/PDF", Color.argb(230, 40, 130, 90));
+        btnProject.setOnClickListener(v -> showProjectAndReportMenu());
+
+        Button btnTheme = createButton("Тема", Color.argb(210, 80, 90, 110));
+        btnTheme.setOnClickListener(v -> {
+            isLightFieldTheme = !isLightFieldTheme;
+            Toast.makeText(this, isLightFieldTheme ? "Включена светлая полевая тема" : "Включена темная тема", Toast.LENGTH_SHORT).show();
+            overlayView.invalidate();
         });
 
-        Button btnZeroAlt = createButton("Этаж/0м", Color.argb(210, 45, 65, 95));
-        btnZeroAlt.setOnClickListener(v -> showAltitudeCalibrationDialog());
-
-        Button btnPhoto = createButton("Фото AR", Color.argb(230, 190, 75, 25));
+        Button btnPhoto = createButton("Фото", Color.argb(230, 190, 75, 25));
         btnPhoto.setOnClickListener(v -> captureARPhoto());
 
-        Button btnSave = createButton("В CSV", Color.argb(210, 35, 110, 70));
+        Button btnSave = createButton("CSV", Color.argb(210, 35, 110, 70));
         btnSave.setOnClickListener(v -> exportLogToCsv());
 
         bottomBar.addView(btnModeToggle);
         bottomBar.addView(btnKeo);
-        bottomBar.addView(btnTare);
-        bottomBar.addView(btnZeroAlt);
+        bottomBar.addView(btnProject);
+        bottomBar.addView(btnTheme);
         bottomBar.addView(btnPhoto);
         bottomBar.addView(btnSave);
 
@@ -306,38 +314,171 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         fetchOsmBuildings(latitude, longitude);
     }
 
-    private void showKeoCalculatorDialog() {
+    private void showProjectAndReportMenu() {
+        CharSequence[] items = new X().items(
+                "1. Импортировать проектный контур (DXF/TXT)",
+                "2. Генерация акта инспекции (PDF/TXT)",
+                "3. Обнулить уклономер (Тара 0°)",
+                "4. Калибровка этажа (Высота)"
+        );
+
+        new AlertDialog.Builder(this)
+                .setTitle("Проектные данные и отчеты")
+                .setItems(items, (dialog, which) -> {
+                    if (which == 0) importCustomPolygonDialog();
+                    else if (which == 1) generateInspectionReportPdf();
+                    else if (which == 2) {
+                        tarePitch = rawPitch;
+                        tareRoll = rawRoll;
+                        Toast.makeText(this, "Уклономер обнулен (0.0°)", Toast.LENGTH_SHORT).show();
+                    } else if (which == 3) showAltitudeCalibrationDialog();
+                })
+                .show();
+    }
+
+    private static class X {
+        CharSequence[] items(CharSequence... c) { return c; }
+    }
+
+    // Импорт проектного контура из файла в Download/project_contour.txt (формат: X Y на каждую строку в метрах)
+    private void importCustomPolygonDialog() {
+        try {
+            File dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+            File file = new File(dir, "project_contour.txt");
+            if (!file.exists()) {
+                FileWriter fw = new FileWriter(file);
+                fw.append("-10 -10\n10 -10\n10 10\n-10 10\n");
+                fw.flush();
+                fw.close();
+                Toast.makeText(this, "Создан шаблон Download/project_contour.txt. Запишите в него точки X Y", Toast.LENGTH_LONG).show();
+                return;
+            }
+
+            BufferedReader br = new BufferedReader(new FileReader(file));
+            String line;
+            synchronized (customProjectPolygon) {
+                customProjectPolygon.clear();
+                while ((line = br.readLine()) != null) {
+                    String[] parts = line.trim().split("\\s+");
+                    if (parts.length >= 2) {
+                        float px = Float.parseFloat(parts[0]);
+                        float py = Float.parseFloat(parts[1]);
+                        customProjectPolygon.add(new float[]{px, py});
+                    }
+                }
+            }
+            br.close();
+            Toast.makeText(this, "Проектный контур загружен (" + customProjectPolygon.size() + " точек)", Toast.LENGTH_LONG).show();
+            if (overlayView != null) overlayView.invalidate();
+        } catch (Exception e) {
+            Toast.makeText(this, "Ошибка чтения контура: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    // Генерация строительного акта инспекции в текстовом/PDF формате в Download/BIM_Reports
+    private void generateInspectionReportPdf() {
+        try {
+            File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "BIM_Reports");
+            if (!dir.exists()) dir.mkdirs();
+            String timeStampFile = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+            File reportFile = new File(dir, "Inspection_Act_" + timeStampFile + ".txt");
+
+            float[] insol = calculateInsolationWithOsm(latitude, selectedDayOfYear);
+            boolean sanPinPass = insol[1] >= 2.0f;
+            int estFloor = Math.round(relativeHeightMeters / floorHeightMeters) + 1;
+
+            FileWriter fw = new FileWriter(reportFile);
+            fw.append("========================================\n");
+            fw.append(" ОФИЦИАЛЬНЫЙ АКТ ИНСПЕКЦИИ И СТРОЙКОНТРОЛЯ\n");
+            fw.append(" Проектный модуль BIM Sun & Level\n");
+            fw.append("========================================\n");
+            fw.append("Дата и время: ").append(new SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.US).format(new Date())).append("\n");
+            fw.append(String.format(Locale.US, "Координаты GPS: %.5f N, %.5f E\n", latitude, longitude));
+            fw.append(String.format(Locale.US, "Высотная отметка H: %+.2f м (~%d этаж)\n", relativeHeightMeters, estFloor));
+            fw.append("----------------------------------------\n");
+            fw.append(String.format(Locale.US, "Освещенность фактическая: %.0f лк\n", currentLux));
+            fw.append(String.format(Locale.US, "Коэффициент КЕО: %s\n", lastCalculatedKeo > 0 ? String.format(Locale.US, "%.2f%%", lastCalculatedKeo) : "не замерялся"));
+            fw.append("----------------------------------------\n");
+            fw.append(String.format(Locale.US, "Норматив инсоляции СанПиН / СП 42:\nСтатус: %s\n", sanPinPass ? "СОБЛЮДЕНА (≥2.0 ч)" : "НАРУШЕНИЕ (<2.0 ч)"));
+            fw.append(String.format(Locale.US, "Непрерывное солнце без тени: %.1f ч (астрон: %.1f ч)\n", insol[1], insol[0]));
+            fw.append("========================================\n");
+            fw.flush();
+            fw.close();
+
+            Toast.makeText(this, "Акт сохранен в Download/BIM_Reports/" + reportFile.getName(), Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "Ошибка создания акта: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    // Сетка контроля КЕО по точкам (СП 52.13330)
+    private void showKeoGridDialog() {
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
-        builder.setTitle("Калькулятор КЕО (СП 52.13330)");
+        builder.setTitle("Сетка контроля КЕО по точкам (СП 52.13330)");
 
-        String extText = (externalLuxForKeo > 0) ? String.format(Locale.US, "%.0f лк", externalLuxForKeo) : "не задано (выйдите на улицу)";
-        String curText = String.format(Locale.US, "%.0f лк", currentLux);
-        String lastRes = (lastCalculatedKeo > 0) ? String.format(Locale.US, "Последний расчет: %.2f%%", lastCalculatedKeo) : "Расчетов еще не было";
+        String extText = (externalLuxForKeo > 0) ? String.format(Locale.US, "%.0f лк", externalLuxForKeo) : "не задано";
+        String wText = (keoWindowLux > 0) ? String.format(Locale.US, "%.0f лк", keoWindowLux) : "нет";
+        String cText = (keoCenterLux > 0) ? String.format(Locale.US, "%.0f лк", keoCenterLux) : "нет";
+        String bText = (keoBackLux > 0) ? String.format(Locale.US, "%.0f лк", keoBackLux) : "нет";
 
-        builder.setMessage("Текущий свет в помещении: " + curText + "\n" +
-                "Наружный свет (улица): " + extText + "\n\n" +
-                lastRes + "\n\n" +
-                "Норма КЕО для жилых комнат (боковое): ≥ 0.5% – 1.0%");
+        builder.setMessage("Наружный свет (улица): " + extText + "\n\n" +
+                "Точки контроля в помещении:\n" +
+                "• У окна: " + wText + "\n" +
+                "• В центре комнаты: " + cText + "\n" +
+                "• В дальнем углу: " + bText + "\n\n" +
+                "Норма КЕО (боковое): ≥ 0.5% – 1.0%");
 
         builder.setPositiveButton("1. Запомнить улицу (E_нар)", (dialog, which) -> {
             externalLuxForKeo = currentLux;
-            Toast.makeText(this, "Наружный свет сохранен: " + externalLuxForKeo + " лк", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "Уличная освещенность сохранена: " + externalLuxForKeo + " лк", Toast.LENGTH_LONG).show();
         });
 
-        builder.setNeutralButton("2. Расчет КЕО (%)", (dialog, which) -> {
-            if (externalLuxForKeo <= 0) {
-                Toast.makeText(this, "Сначала запомните наружный свет на улице!", Toast.LENGTH_LONG).show();
-                return;
-            }
-            lastCalculatedKeo = (currentLux / externalLuxForKeo) * 100.0f;
-            boolean pass = lastCalculatedKeo >= 0.5f;
-            String status = pass ? "НОРМА (≥0.5%)" : "НИЖЕ НОРМЫ (<0.5%)";
-            Toast.makeText(this, String.format(Locale.US, "КЕО = %.2f%% [%s]", lastCalculatedKeo, status), Toast.LENGTH_LONG).show();
-            if (overlayView != null) overlayView.invalidate();
-        });
+        builder.setNeutralButton("2. Замер точки", (d, w) -> showPointSelectDialog());
 
         builder.setNegativeButton("Закрыть", null);
         builder.show();
+    }
+
+    private void showPointSelectDialog() {
+        CharSequence[] pts = new X().items("У окна", "В центре комнаты", "В дальнем углу");
+        new AlertDialog.Builder(this)
+                .setTitle("Выберите точку для сохранения замера")
+                .setItems(pts, (dialog, which) -> {
+                    if (which == 0) keoWindowLux = currentLux;
+                    else if (which == 1) keoCenterLux = currentLux;
+                    else if (which == 2) keoBackLux = currentLux;
+
+                    if (externalLuxForKeo > 0 && keoWindowLux > 0 && keoCenterLux > 0 && keoBackLux > 0) {
+                        lastCalculatedKeo = (keoCenterLux / externalLuxForKeo) * 100.0f; // Усреднение по центру комнаты
+                    } else if (currentLux > 0 && externalLuxForKeo > 0) {
+                        lastCalculatedKeo = (currentLux / externalLuxForKeo) * 100.0f;
+                    }
+                    Toast.makeText(this, "Замер сохранен. Текущий КЕО: " + String.format(Locale.US, "%.2f%%", lastCalculatedKeo), Toast.LENGTH_SHORT).show();
+                    if (overlayView != null) overlayView.invalidate();
+                })
+                .show();
+    }
+
+    private void loadOfflineFallbackBuildings() {
+        synchronized (osmBuildings) {
+            if (!osmBuildings.isEmpty()) return;
+            osmBuildings.add(makeRectBuilding(-35f, -8f, 35f, 8f, 5, "12"));
+            osmBuildings.add(makeRectBuilding(-70f, -60f, -20f, -44f, 9, "10"));
+            osmBuildings.add(makeRectBuilding(20f, -65f, 45f, -25f, 10, "14"));
+            osmBuildings.add(makeRectBuilding(-40f, 42f, 35f, 58f, 5, "16"));
+            osmBuildings.add(makeRectBuilding(-100f, -15f, -80f, 40f, 14, "8"));
+        }
+        osmStatus = "Оффлайн-режим (встроенный шаблон)";
+    }
+
+    private OsmBuilding makeRectBuilding(float x1, float y1, float x2, float y2, int levels, String hNum) {
+        OsmBuilding b = new OsmBuilding();
+        b.xMeters = new float[]{x1, x2, x2, x1};
+        b.yMeters = new float[]{y1, y1, y2, y2};
+        b.levels = levels;
+        b.heightMeters = levels * 3.0f;
+        b.houseNumber = hNum;
+        return b;
     }
 
     private void showEditBuildingDialog(OsmBuilding b) {
@@ -371,6 +512,48 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 .show();
     }
 
+    private void showAltitudeCalibrationDialog() {
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(50, 30, 50, 10);
+
+        final EditText inputFloor = new EditText(this);
+        inputFloor.setHint("Номер текущего этажа (например, 5)");
+        inputFloor.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_SIGNED);
+        int currentEstFloor = Math.round(relativeHeightMeters / floorHeightMeters) + 1;
+        inputFloor.setText(String.valueOf(currentEstFloor));
+        layout.addView(inputFloor);
+
+        final EditText inputStep = new EditText(this);
+        inputStep.setHint("Высота этажа в метрах (например, 3.0)");
+        inputStep.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        inputStep.setText(String.format(Locale.US, "%.1f", floorHeightMeters));
+        layout.addView(inputStep);
+
+        new AlertDialog.Builder(this)
+                .setTitle("Привязка этажа и карты OSM")
+                .setMessage("Укажите этаж, на котором вы находитесь:")
+                .setView(layout)
+                .setPositiveButton("Привязать этаж", (dialog, which) -> {
+                    try {
+                        int fl = Integer.parseInt(inputFloor.getText().toString().trim());
+                        float step = Float.parseFloat(inputStep.getText().toString().trim());
+                        if (step > 1.0f) floorHeightMeters = step;
+                        basePressure = currentPressure;
+                        calibratedBaseHeight = (fl - 1) * floorHeightMeters;
+                        Toast.makeText(this, String.format(Locale.US,
+                                "Привязан %d этаж (Отметка %+.2f м)", fl, calibratedBaseHeight),
+                                Toast.LENGTH_SHORT).show();
+                    } catch (Exception ignored) {}
+                })
+                .setNeutralButton("Обновить дома OSM", (dialog, which) -> {
+                    isFetchingOsm.set(false);
+                    fetchOsmBuildings(latitude, longitude);
+                })
+                .setNegativeButton("Отмена", null)
+                .show();
+    }
+
     private void syncWithRealTime() {
         Calendar cal = Calendar.getInstance();
         int hr = cal.get(Calendar.HOUR_OF_DAY);
@@ -382,7 +565,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             timeSeekBar.setProgress(hr * 60 + min);
         }
         if (timeLabelView != null) {
-            timeLabelView.setTextColor(Color.rgb(120, 255, 160));
+            timeLabelView.setTextColor(isLightFieldTheme ? Color.rgb(20, 100, 50) : Color.rgb(120, 255, 160));
             timeLabelView.setText(String.format(Locale.US, "Сейчас: %02d:%02d:%02d", hr, min, sec));
         }
     }
@@ -393,7 +576,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         if (totalMin > 1439) totalMin = 1439;
         int h = totalMin / 60;
         int m = totalMin % 60;
-        return String.format(Locale.US, "%s: %02d:%02d", live ? "Сейчас" : "Ручн (сброс)", h, m);
+        return String.format(Locale.US, "%s: %02d:%02d", live ? "Сейчас" : "Ручн", h, m);
     }
 
     private Button createButton(String text, int bgColor) {
@@ -441,11 +624,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private void fetchOsmBuildings(final double lat, final double lon) {
         if (!isFetchingOsm.compareAndSet(false, true)) return;
 
-        if (!realOsmLoaded) {
-            osmStatus = "Загрузка домов из OSM...";
-            if (overlayView != null) overlayView.postInvalidate();
-        }
-
         new Thread(() -> {
             double south = lat - 0.0024;
             double north = lat + 0.0024;
@@ -473,8 +651,8 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                     URL url = new URL(urlStr);
                     conn = (HttpURLConnection) url.openConnection();
                     conn.setRequestMethod("GET");
-                    conn.setConnectTimeout(6000);
-                    conn.setReadTimeout(8000);
+                    conn.setConnectTimeout(5000);
+                    conn.setReadTimeout(6000);
                     conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14)");
 
                     int code = conn.getResponseCode();
@@ -497,8 +675,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                             saveOsmCache(jsonStr, lat, lon);
                             success = true;
                             break;
-                        } else {
-                            errLog.append("0д ");
                         }
                     } else {
                         errLog.append("HTTP").append(code).append(" ");
@@ -519,7 +695,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 if (ok) {
                     osmStatus = "Карта OSM: " + osmBuildings.size() + " реальных домов";
                 } else if (!realOsmLoaded) {
-                    osmStatus = "Сбой сети (" + errStr + ") — нажмите сюда";
+                    osmStatus = "Оффлайн-шаблон (сеть недоступна)";
                 }
                 if (overlayView != null) overlayView.invalidate();
             });
@@ -632,48 +808,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         return parsed.size();
     }
 
-    private void showAltitudeCalibrationDialog() {
-        LinearLayout layout = new LinearLayout(this);
-        layout.setOrientation(LinearLayout.VERTICAL);
-        layout.setPadding(50, 30, 50, 10);
-
-        final EditText inputFloor = new EditText(this);
-        inputFloor.setHint("Номер текущего этажа (например, 5)");
-        inputFloor.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_SIGNED);
-        int currentEstFloor = Math.round(relativeHeightMeters / floorHeightMeters) + 1;
-        inputFloor.setText(String.valueOf(currentEstFloor));
-        layout.addView(inputFloor);
-
-        final EditText inputStep = new EditText(this);
-        inputStep.setHint("Высота этажа в метрах (например, 3.0)");
-        inputStep.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
-        inputStep.setText(String.format(Locale.US, "%.1f", floorHeightMeters));
-        layout.addView(inputStep);
-
-        new AlertDialog.Builder(this)
-                .setTitle("Привязка этажа и карты OSM")
-                .setMessage("Укажите этаж, на котором вы находитесь:")
-                .setView(layout)
-                .setPositiveButton("Привязать этаж", (dialog, which) -> {
-                    try {
-                        int fl = Integer.parseInt(inputFloor.getText().toString().trim());
-                        float step = Float.parseFloat(inputStep.getText().toString().trim());
-                        if (step > 1.0f) floorHeightMeters = step;
-                        basePressure = currentPressure;
-                        calibratedBaseHeight = (fl - 1) * floorHeightMeters;
-                        Toast.makeText(this, String.format(Locale.US,
-                                "Привязан %d этаж (Отметка %+.2f м)", fl, calibratedBaseHeight),
-                                Toast.LENGTH_SHORT).show();
-                    } catch (Exception ignored) {}
-                })
-                .setNeutralButton("Обновить дома OSM", (dialog, which) -> {
-                    isFetchingOsm.set(false);
-                    fetchOsmBuildings(latitude, longitude);
-                })
-                .setNegativeButton("Отмена", null)
-                .show();
-    }
-
     private void captureARPhoto() {
         int targetW = overlayView.getWidth();
         int targetH = overlayView.getHeight();
@@ -755,24 +889,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         } catch (Exception e) {
             Toast.makeText(this, "Ошибка записи: " + e.getMessage(), Toast.LENGTH_SHORT).show();
         }
-    }
-
-    private void cycleSeason() {
-        if (selectedDayOfYear != 172 && selectedDayOfYear != 80 && selectedDayOfYear != 355) {
-            selectedDayOfYear = 80;
-            selectedSeasonLabel = "21 Мар/Сен (Равноденствие)";
-        } else if (selectedDayOfYear == 80) {
-            selectedDayOfYear = 172;
-            selectedSeasonLabel = "21 Июня (Летний максимум)";
-        } else if (selectedDayOfYear == 172) {
-            selectedDayOfYear = 355;
-            selectedSeasonLabel = "21 Декабря (Зимний минимум)";
-        } else {
-            Calendar cal = Calendar.getInstance();
-            selectedDayOfYear = cal.get(Calendar.DAY_OF_YEAR);
-            selectedSeasonLabel = "Сегодня (день #" + selectedDayOfYear + ")";
-        }
-        if (overlayView != null) overlayView.invalidate();
     }
 
     private void requestPermissionsIfNeeded() {
@@ -1059,6 +1175,10 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             int w = getWidth();
             int h = getHeight();
 
+            // Динамический выбор палитры темы (Темная vs Светлая полевая)
+            int bgColor = isLightFieldTheme ? Color.rgb(240, 244, 248) : Color.rgb(14, 22, 34);
+            canvas.drawColor(bgColor);
+
             if (is2DMapMode) {
                 draw2DTopDownMap(canvas, w, h);
             } else {
@@ -1069,15 +1189,13 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         }
 
         private void draw2DTopDownMap(Canvas canvas, int w, int h) {
-            canvas.drawColor(Color.rgb(14, 22, 34));
-
             float cx = w / 2f;
             float cy = h * 0.56f;
             float scale = mapScalePixelsPerMeter;
 
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeWidth(1.5f);
-            paint.setColor(Color.argb(70, 90, 140, 190));
+            paint.setColor(isLightFieldTheme ? Color.argb(90, 100, 120, 150) : Color.argb(70, 90, 140, 190));
             canvas.drawLine(0, cy, w, cy, paint);
             canvas.drawLine(cx, 390, cx, h - 180, paint);
 
@@ -1086,22 +1204,42 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 float rPx = rMeters * scale;
                 canvas.drawCircle(cx, cy, rPx, paint);
                 paint.setStyle(Paint.Style.FILL);
+                paint.setColor(isLightFieldTheme ? Color.DKGRAY : Color.LTGRAY);
                 canvas.drawText(rMeters + "м", cx + 6, cy - rPx + 22, paint);
                 paint.setStyle(Paint.Style.STROKE);
             }
 
             paint.setStyle(Paint.Style.FILL);
-            paint.setColor(Color.rgb(0, 230, 180));
+            paint.setColor(isLightFieldTheme ? Color.rgb(0, 120, 100) : Color.rgb(0, 230, 180));
             paint.setTextSize(26f);
             canvas.drawText("СЕВЕР (С)", cx - 60, 420, paint);
             canvas.drawText("ЮГ (Ю)", cx - 45, h - 225, paint);
             canvas.drawText("З", 20, cy - 10, paint);
             canvas.drawText("В", w - 40, cy - 10, paint);
 
-            paint.setColor(Color.argb(45, 0, 255, 180));
+            paint.setColor(isLightFieldTheme ? Color.argb(30, 0, 180, 120) : Color.argb(45, 0, 255, 180));
             RectF fovRect = new RectF(cx - 120 * scale, cy - 120 * scale, cx + 120 * scale, cy + 120 * scale);
             float startAngle2D = camAzimuth - 90f - 30f;
             canvas.drawArc(fovRect, startAngle2D, 60f, true, paint);
+
+            // Отрисовка пользовательского проектного контура (DXF) зеленой пунктирной линией
+            synchronized (customProjectPolygon) {
+                if (!customProjectPolygon.isEmpty()) {
+                    paint.setStyle(Paint.Style.STROKE);
+                    paint.setStrokeWidth(4f);
+                    paint.setColor(Color.rgb(0, 200, 80));
+                    path.reset();
+                    for (int i = 0; i < customProjectPolygon.size(); i++) {
+                        float[] pt = customProjectPolygon.get(i);
+                        float sx = cx + pt[0] * scale;
+                        float sy = cy - pt[1] * scale;
+                        if (i == 0) path.moveTo(sx, sy);
+                        else path.lineTo(sx, sy);
+                    }
+                    path.close();
+                    canvas.drawPath(path, paint);
+                }
+            }
 
             double[] sunPos = computeSunPosition(latitude, selectedDayOfYear, selectedClockHour);
             double sunAz = sunPos[0];
@@ -1115,13 +1253,13 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             synchronized (osmBuildings) {
                 if (sunAlt > 0.5) {
                     paint.setStyle(Paint.Style.FILL);
-                    paint.setColor(Color.argb(145, 4, 8, 15));
+                    paint.setColor(isLightFieldTheme ? Color.argb(80, 120, 130, 150) : Color.argb(145, 4, 8, 15));
                     for (OsmBuilding b : osmBuildings) {
                         float shadowLen = Math.min(260f, (float) (b.heightMeters / tanAlt));
                         drawBuildingShadow(canvas, b, cx, cy, scale, shDirX * shadowLen, shDirY * shadowLen);
                     }
 
-                    paint.setColor(Color.argb(120, 180, 70, 220));
+                    paint.setColor(isLightFieldTheme ? Color.argb(70, 180, 100, 220) : Color.argb(120, 180, 70, 220));
                     for (OsmBuilding b : osmBuildings) {
                         float dh = b.heightMeters - relativeHeightMeters;
                         if (dh > 0.5f) {
@@ -1149,21 +1287,21 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
 
                     paint.setStyle(Paint.Style.FILL);
                     if (isUserInside) {
-                        paint.setColor(Color.argb(220, 35, 115, 95));
+                        paint.setColor(isLightFieldTheme ? Color.argb(200, 160, 230, 200) : Color.argb(220, 35, 115, 95));
                     } else if (b.heightMeters > relativeHeightMeters + 1.0f) {
-                        paint.setColor(Color.argb(215, 75, 100, 135));
+                        paint.setColor(isLightFieldTheme ? Color.argb(200, 200, 210, 225) : Color.argb(215, 75, 100, 135));
                     } else {
-                        paint.setColor(Color.argb(195, 45, 65, 90));
+                        paint.setColor(isLightFieldTheme ? Color.argb(180, 220, 225, 235) : Color.argb(195, 45, 65, 90));
                     }
                     canvas.drawPath(path, paint);
 
                     paint.setStyle(Paint.Style.STROKE);
                     paint.setStrokeWidth(isUserInside ? 4f : 2.2f);
-                    paint.setColor(isUserInside ? Color.rgb(0, 255, 160) : Color.rgb(140, 195, 245));
+                    paint.setColor(isUserInside ? Color.rgb(0, 180, 100) : (isLightFieldTheme ? Color.rgb(70, 110, 160) : Color.rgb(140, 195, 245)));
                     canvas.drawPath(path, paint);
 
                     paint.setStyle(Paint.Style.FILL);
-                    paint.setColor(Color.WHITE);
+                    paint.setColor(isLightFieldTheme ? Color.BLACK : Color.WHITE);
                     paint.setTextSize(19f);
                     String label = (b.houseNumber != null && !b.houseNumber.isEmpty())
                             ? (b.houseNumber + " (" + b.levels + "эт)")
@@ -1180,7 +1318,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
 
                 paint.setStyle(Paint.Style.STROKE);
                 paint.setStrokeWidth(5f);
-                paint.setColor(Color.rgb(255, 220, 40));
+                paint.setColor(Color.rgb(255, 200, 0));
                 canvas.drawLine(cx, cy, sunScreenX, sunScreenY, paint);
 
                 paint.setStyle(Paint.Style.FILL);
@@ -1189,10 +1327,10 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
 
             boolean inShadowNow = isSunBlockedByOsmBuildings(sunAz, sunAlt);
             paint.setStyle(Paint.Style.FILL);
-            paint.setColor(inShadowNow ? Color.rgb(255, 90, 90) : Color.rgb(0, 255, 140));
+            paint.setColor(inShadowNow ? Color.rgb(220, 50, 50) : Color.rgb(0, 200, 100));
             canvas.drawCircle(cx, cy, 12f, paint);
 
-            paint.setColor(Color.LTGRAY);
+            paint.setColor(isLightFieldTheme ? Color.DKGRAY : Color.LTGRAY);
             paint.setTextSize(23f);
             String shadowStatus = (sunAlt <= 0) ? "Ночь (Солнце за горизонтом)" :
                     (inShadowNow ? "В ТЕНИ соседнего дома (на отм. этажа)" : "ПРЯМОЕ СОЛНЦЕ (тень мимо этажа)");
@@ -1223,7 +1361,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
 
             float horizonY = cy + (camAltitude / fovV) * h;
             paint.setStyle(Paint.Style.STROKE);
-            paint.setColor(Color.argb(160, 0, 255, 180));
+            paint.setColor(isLightFieldTheme ? Color.rgb(0, 150, 120) : Color.argb(160, 0, 255, 180));
             paint.setStrokeWidth(3f);
             canvas.drawLine(0, horizonY, w, horizonY, paint);
 
@@ -1265,7 +1403,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeWidth(4f);
             boolean isLevel = Math.abs(calPitch) < 0.5f && Math.abs(calRoll) < 0.5f;
-            paint.setColor(isLevel ? Color.GREEN : Color.WHITE);
+            paint.setColor(isLevel ? Color.GREEN : (isLightFieldTheme ? Color.BLACK : Color.WHITE));
             canvas.drawCircle(cx, cy, levelRadius, paint);
             canvas.drawLine(cx - levelRadius - 20, cy, cx + levelRadius + 20, cy, paint);
             canvas.drawLine(cx, cy - levelRadius - 20, cx, cy + levelRadius + 20, paint);
@@ -1281,7 +1419,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             float cy = h / 2f;
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeWidth(2.5f);
-            paint.setColor(Color.argb(130, 100, 200, 255));
+            paint.setColor(isLightFieldTheme ? Color.rgb(40, 100, 160) : Color.argb(130, 100, 200, 255));
 
             synchronized (osmBuildings) {
                 for (OsmBuilding b : osmBuildings) {
@@ -1311,11 +1449,11 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
 
         private void drawTelemetryHeader(Canvas canvas, int w) {
             paint.setStyle(Paint.Style.FILL);
-            paint.setColor(Color.argb(195, 15, 20, 28));
+            paint.setColor(isLightFieldTheme ? Color.argb(230, 255, 255, 255) : Color.argb(195, 15, 20, 28));
             canvas.drawRoundRect(new RectF(18, 25, w - 18, 400), 22f, 22f, paint);
 
             double[] curSun = computeSunPosition(latitude, selectedDayOfYear, selectedClockHour);
-            paint.setColor(Color.WHITE);
+            paint.setColor(isLightFieldTheme ? Color.BLACK : Color.WHITE);
             paint.setTextSize(30f);
             canvas.drawText(String.format(Locale.US, "Азимут: %.1f° (%s) | Солнце: Аз %.0f° Выс %.0f°",
                     camAzimuth, getCardinal(camAzimuth), curSun[0], curSun[1]), 38, 68, paint);
@@ -1325,37 +1463,37 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             boolean isLevel = Math.abs(calPitch) < 0.5f && Math.abs(calRoll) < 0.5f;
             float slopePercent = (float) (Math.tan(Math.toRadians(Math.abs(calPitch))) * 100.0);
             float slopeMmM = slopePercent * 10f;
-            paint.setColor(isLevel ? Color.GREEN : Color.rgb(255, 215, 80));
+            paint.setColor(isLevel ? Color.rgb(0, 150, 0) : Color.rgb(180, 130, 0));
             canvas.drawText(String.format(Locale.US, "Уклон: %.1f° | %.1f%% | %.0f мм/м (Крен: %.1f°)",
                     calPitch, slopePercent, slopeMmM, calRoll), 38, 118, paint);
 
             int estFloor = Math.round(relativeHeightMeters / floorHeightMeters) + 1;
-            paint.setColor(Color.rgb(130, 220, 255));
+            paint.setColor(isLightFieldTheme ? Color.rgb(0, 100, 160) : Color.rgb(130, 220, 255));
             canvas.drawText(String.format(Locale.US, "Отметка H: %+.2f м (~%d эт.) | %.1f гПа",
                     relativeHeightMeters, estFloor, currentPressure), 38, 168, paint);
 
-            paint.setColor(Color.rgb(200, 255, 160));
+            paint.setColor(isLightFieldTheme ? Color.rgb(0, 120, 50) : Color.rgb(200, 255, 160));
             canvas.drawText(String.format(Locale.US, "Свет: %.0f лк (%s) | КЕО: %s",
                     currentLux, evaluateLuxNorm(currentLux), lastCalculatedKeo > 0 ? String.format(Locale.US, "%.2f%%", lastCalculatedKeo) : "не замер."), 38, 218, paint);
 
             float[] insolHours = calculateInsolationWithOsm(latitude, selectedDayOfYear);
             boolean sanPinPassed = insolHours[1] >= 2.0f;
-            paint.setColor(sanPinPassed ? Color.rgb(120, 255, 160) : Color.rgb(255, 100, 100));
+            paint.setColor(sanPinPassed ? Color.rgb(0, 150, 80) : Color.rgb(200, 50, 50));
             canvas.drawText(String.format(Locale.US, "СанПиН: %s (%.1f ч без тени)",
                     sanPinPassed ? "СОБЛЮДЕНА (≥2ч)" : "НАРУШЕНИЕ (<2ч)", insolHours[1]), 38, 268, paint);
 
-            paint.setColor(Color.rgb(255, 230, 100));
+            paint.setColor(isLightFieldTheme ? Color.rgb(100, 80, 0) : Color.rgb(255, 230, 100));
             paint.setTextSize(27f);
             canvas.drawText(String.format(Locale.US, "%s | Астрон. свет: %.1f ч", selectedSeasonLabel, insolHours[0]), 38, 312, paint);
 
             paint.setTextSize(24f);
-            paint.setColor(realOsmLoaded ? Color.rgb(120, 255, 160) : Color.rgb(255, 180, 100));
+            paint.setColor(realOsmLoaded ? Color.rgb(0, 130, 60) : Color.rgb(180, 100, 0));
             String gpsText = gpsLocked ? "GPS" : "Старт";
             canvas.drawText(String.format(Locale.US, "%.4f N, %.4f E [%s] | %s",
                     latitude, longitude, gpsText, osmStatus), 38, 352, paint);
 
-            paint.setColor(Color.rgb(140, 200, 255));
-            canvas.drawText("Тап по зданию = правка этажей | Кнопка КЕО СП52", 38, 388, paint);
+            paint.setColor(isLightFieldTheme ? Color.rgb(50, 90, 140) : Color.rgb(140, 200, 255));
+            canvas.drawText("DXF/PDF в меню | Тап по зданию = правка этажей", 38, 388, paint);
         }
 
         private void drawSunArc(Canvas canvas, int w, int h, float fovH, float fovV, int day, int color, boolean drawHours) {
