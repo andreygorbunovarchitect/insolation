@@ -8,22 +8,61 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import android.graphics.*;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.ImageFormat;
+import android.graphics.Matrix;
+import android.graphics.Paint;
+import android.graphics.Path;
+import android.graphics.Rect;
+import android.graphics.RectF;
+import android.graphics.YuvImage;
 import android.graphics.pdf.PdfDocument;
-import android.hardware.*;
-import android.location.*;
+import android.hardware.Camera;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
+import android.location.Location;
+import android.location.LocationListener;
+import android.location.LocationManager;
 import android.net.Uri;
-import android.os.*;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Environment;
 import android.provider.MediaStore;
 import android.text.InputType;
-import android.view.*;
-import android.widget.*;
-import org.json.*;
-import java.io.*;
-import java.net.*;
+import android.view.Gravity;
+import android.view.MotionEvent;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
+import android.view.View;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.SeekBar;
+import android.widget.TextView;
+import android.widget.Toast;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import java.text.SimpleDateFormat;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Calendar;
+import java.util.List;
+import java.util.Locale;
+import java.util.TimeZone;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 @SuppressWarnings("deprecation")
@@ -58,17 +97,14 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private float camAzimuth = 0f, camAltitude = 0f, camRoll = 0f;
     private float rawPitch = 0f, rawRoll = 0f, tarePitch = 0f, tareRoll = 0f;
 
-    // Автоматическое и ручное определение отметки H и этажа
     private float currentPressure = 1013.25f, autoGroundPressure = -1f, autoGroundElevationASL = -1f;
     private float manualRefPressure = -1f, manualRefHeight = 0f, floorHeightMeters = 3.0f, relativeHeightMeters = 0f;
     private boolean isManualHeightMode = false;
     private final AtomicBoolean isFetchingMeteo = new AtomicBoolean(false);
 
-    // Люксметр и сетка КЕО (СП 52.13330)
     private float currentLux = 0f, externalLuxForKeo = -1f, keoWin = -1f, keoCen = -1f, keoBack = -1f, lastKeo = -1f;
     private boolean showKeoHeatmap = false;
 
-    // 3D AR-рулетка (0=Выкл, 1=Стена/Окно на дист. D, 2=От пола вверх, 3=По полу 3D)
     private int tapeMode = 0;
     private Float tapeAz1 = null, tapeAlt1 = null, tapeAz2 = null, tapeAlt2 = null;
     private float tapeWallDist = 2.50f, tapeEyeHeight = 1.60f;
@@ -242,7 +278,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         }
     }
 
-    // --- Авто-определение рельефа и давления на уровне земли (Open-Meteo) ---
     private void fetchAutoGroundMeteo(final double lat, final double lon) {
         if (!isFetchingMeteo.compareAndSet(false, true)) return;
         new Thread(() -> {
@@ -325,7 +360,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 .setNegativeButton("Отмена", null).show();
     }
 
-    // --- 3D AR-Рулетка ---
     private void triggerTapePoint() {
         if (tapeAz1 == null || tapeAz2 != null) {
             tapeAz1 = camAzimuth; tapeAlt1 = camAltitude; tapeAz2 = tapeAlt2 = null;
@@ -387,7 +421,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 .setNegativeButton("Выкл", (d, w) -> { tapeMode = 0; overlayView.invalidate(); }).show();
     }
 
-    // --- Загрузка OSM и Геолокация ---
     private void loadSavedState() {
         try {
             SharedPreferences p = getSharedPreferences("osm_cache_v8", MODE_PRIVATE);
@@ -498,7 +531,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         return b;
     }
 
-    // --- Меню BIM, DXF/IFC, КЕО и PDF ---
     private void showToolsMenu() {
         CharSequence[] items = {"1. Поиск адреса или ввод координат", "2. Импорт контура (.dxf / .ifc / .txt)",
                 "3. Тара уклономера (0.0°)", "4. Смена темы (Темная / Дневная)", "5. Смена сезона", "6. Фото AR в Галерею", "7. Экспорт в CSV"};
@@ -705,8 +737,33 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private void captureARPhoto() {
         int w = overlayView.getWidth(), h = overlayView.getHeight();
         if (w <= 0 || h <= 0) return;
+        if (!is2DMapMode && camera != null) {
+            try {
+                camera.setOneShotPreviewCallback((data, cam) -> {
+                    try {
+                        Camera.Size s = cam.getParameters().getPreviewSize();
+                        YuvImage yuv = new YuvImage(data, ImageFormat.NV21, s.width, s.height, null);
+                        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                        yuv.compressToJpeg(new Rect(0, 0, s.width, s.height), 92, baos);
+                        Bitmap raw = BitmapFactory.decodeByteArray(baos.toByteArray(), 0, baos.size());
+                        Matrix m = new Matrix(); m.postRotate(90);
+                        Bitmap rot = Bitmap.createBitmap(raw, 0, 0, raw.getWidth(), raw.getHeight(), m, true);
+                        raw.recycle();
+                        savePhotoBmp(rot, w, h);
+                    } catch (Exception e) { savePhotoBmp(null, w, h); }
+                });
+                return;
+            } catch (Exception ignored) {}
+        }
+        savePhotoBmp(null, w, h);
+    }
+
+    private void savePhotoBmp(Bitmap camBmp, int w, int h) {
         Bitmap b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-        Canvas c = new Canvas(b); c.drawColor(Color.rgb(16, 24, 36)); overlayView.draw(c);
+        Canvas c = new Canvas(b);
+        if (camBmp != null) { c.drawBitmap(camBmp, null, new Rect(0, 0, w, h), null); camBmp.recycle(); }
+        else c.drawColor(Color.rgb(16, 24, 36));
+        overlayView.draw(c);
         try {
             ContentValues cv = new ContentValues();
             cv.put(MediaStore.Images.Media.DISPLAY_NAME, "BIM_" + System.currentTimeMillis() + ".jpg");
@@ -913,7 +970,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             }
             c.drawPath(path, paint);
 
-            float r = 85f * ui, calP = rawPitch - tarePitch, calR = rawRoll - tareRoll;
+            float r = 85f * ui, calP = rawPitch - tarePitch;
             paint.setColor(Math.abs(calP) < 0.5f ? Color.GREEN : Color.WHITE);
             c.drawCircle(cx, cy, r, paint); c.drawLine(cx - r - 20 * ui, cy, cx + r + 20 * ui, cy, paint); c.drawLine(cx, cy - r - 20 * ui, cx, cy + r + 20 * ui, paint);
 
