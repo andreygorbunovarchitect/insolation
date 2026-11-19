@@ -28,6 +28,8 @@ import android.hardware.SensorManager;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
+import android.media.AudioManager;
+import android.media.ToneGenerator;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -35,6 +37,7 @@ import android.os.Environment;
 import android.provider.MediaStore;
 import android.text.InputType;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -52,14 +55,17 @@ import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
+import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 import java.util.TimeZone;
@@ -73,6 +79,8 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private boolean hasRotVec = false, hasBaro = false, hasAcc = false, hasMag = false;
     private final float[] lastAcc = {0f, 0f, 9.81f}, lastMag = {0f, 1f, 0f};
     private final float[] rotMat = new float[9], remapMat = new float[9], orient = new float[3];
+    private ToneGenerator toneGen;
+    private boolean wasLevel = false;
 
     private LocationManager locationManager;
     private final LocationListener locListener = new LocationListener() {
@@ -108,6 +116,9 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private int tapeMode = 0;
     private Float tapeAz1 = null, tapeAlt1 = null, tapeAz2 = null, tapeAlt2 = null;
     private float tapeWallDist = 2.50f, tapeEyeHeight = 1.60f;
+    private String lastTapeSummary = "", lastDefectStamp = "Оси А-Б / Осмотр фасада";
+    private String cloudBimUrl = "https://viewer.autodesk.com/";
+    private Uri lastCreatedUri = null;
 
     private final List<float[]> customPoly = new ArrayList<>();
     private float customProjHeight = 24.0f;
@@ -134,6 +145,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         super.onCreate(savedInstanceState);
         selectedDay = Calendar.getInstance().get(Calendar.DAY_OF_YEAR);
         seasonLabel = "День #" + selectedDay;
+        try { toneGen = new ToneGenerator(AudioManager.STREAM_NOTIFICATION, 60); } catch (Exception ignored) {}
         loadSavedState();
 
         FrameLayout root = new FrameLayout(this);
@@ -145,6 +157,11 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         overlayView.setOnTouchListener((v, ev) -> {
             if (ev.getAction() != MotionEvent.ACTION_DOWN) return false;
             float tx = ev.getX(), ty = ev.getY(), ui = v.getWidth() / 1080f;
+
+            // Быстрые кнопки [▲ Эт] и [▼ Эт] справа под мини-радаром
+            if (tx >= v.getWidth() - 150 * ui && ty >= 555 * ui && ty <= 635 * ui) { adjustFloorStep(1); return true; }
+            if (tx >= v.getWidth() - 150 * ui && ty >= 645 * ui && ty <= 725 * ui) { adjustFloorStep(-1); return true; }
+
             if (ty >= 120 * ui && ty <= 195 * ui) { showAltitudeDialog(); return true; }
             if (ty < 385 * ui) {
                 startLocationUpdates();
@@ -233,7 +250,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             else showTapeDialog();
             overlayView.invalidate();
         }));
-        bar.addView(mkBtn("Этаж/H", Color.argb(230, 65, 105, 175), v -> showAltitudeDialog()));
+        bar.addView(mkBtn("Фото", Color.argb(230, 195, 85, 25), v -> showDefectPhotoDialog()));
         bar.addView(mkBtn("КЕО", Color.argb(230, 155, 50, 175), v -> showKeoDialog()));
         bar.addView(mkBtn("Меню BIM", Color.argb(230, 40, 130, 95), v -> showToolsMenu()));
         bar.addView(mkBtn("Акт PDF", Color.argb(230, 185, 55, 45), v -> generatePdfReport()));
@@ -276,6 +293,19 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             timeLabelView.setTextColor(isLightTheme ? Color.rgb(0, 120, 60) : Color.rgb(120, 255, 160));
             timeLabelView.setText(String.format(Locale.US, "Сейчас: %02d:%02d:%02d", h, m, s));
         }
+    }
+
+    private void adjustFloorStep(int delta) {
+        int nextFl = Math.max(1, Math.max(1, Math.round(relativeHeightMeters / floorHeightMeters) + 1) + delta);
+        isManualHeightMode = true;
+        manualRefPressure = currentPressure;
+        manualRefHeight = (nextFl - 1) * floorHeightMeters;
+        recalcHeight();
+        if (overlayView != null) {
+            overlayView.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+            overlayView.invalidate();
+        }
+        Toast.makeText(this, String.format(Locale.US, "Этаж %d (%+.1f м)", nextFl, relativeHeightMeters), Toast.LENGTH_SHORT).show();
     }
 
     private void fetchAutoGroundMeteo(final double lat, final double lon) {
@@ -330,15 +360,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         inSt.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
         inSt.setText(String.format(Locale.US, "%.1f", floorHeightMeters));
 
-        LinearLayout qRow = new LinearLayout(this);
-        LinearLayout.LayoutParams qp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-        Button bM = new Button(this); bM.setText("-1 эт");
-        bM.setOnClickListener(v -> { try { inFl.setText(String.valueOf(Math.max(1, Integer.parseInt(inFl.getText().toString().trim()) - 1))); } catch (Exception ignored) {} });
-        Button b0 = new Button(this); b0.setText("1 эт (0м)"); b0.setOnClickListener(v -> inFl.setText("1"));
-        Button bP = new Button(this); bP.setText("+1 эт");
-        bP.setOnClickListener(v -> { try { inFl.setText(String.valueOf(Integer.parseInt(inFl.getText().toString().trim()) + 1)); } catch (Exception ignored) {} });
-        qRow.addView(bM, qp); qRow.addView(b0, qp); qRow.addView(bP, qp);
-        lay.addView(qRow);
         TextView t1 = new TextView(this); t1.setText("Текущий этаж:"); lay.addView(t1); lay.addView(inFl);
         TextView t2 = new TextView(this); t2.setText("Высота этажа (м):"); lay.addView(t2); lay.addView(inSt);
 
@@ -366,6 +387,8 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             if (tapeMode == 1) autoDetectWallDist();
         } else {
             tapeAz2 = camAzimuth; tapeAlt2 = camAltitude;
+            float[] m = calcTape(tapeAz1, tapeAlt1, tapeAz2, tapeAlt2);
+            lastTapeSummary = String.format(Locale.US, "L=%.2fм, ΔH=%.2fм, ΔW=%.2fм, S=%.2fм²", m[0], m[1], m[2], m[4]);
         }
     }
 
@@ -428,6 +451,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 latitude = Double.longBitsToDouble(p.getLong("lat", Double.doubleToRawLongBits(latitude)));
                 longitude = Double.longBitsToDouble(p.getLong("lon", Double.doubleToRawLongBits(longitude)));
             }
+            cloudBimUrl = p.getString("bim_url", cloudBimUrl);
             String j = p.getString("json", null);
             if (j != null) {
                 rawOsmCache = j;
@@ -452,7 +476,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 try {
                     c = (HttpURLConnection) new URL(ep + "?data=" + URLEncoder.encode(q, "UTF-8")).openConnection();
                     c.setConnectTimeout(7000); c.setReadTimeout(10000);
-                    c.setRequestProperty("User-Agent", "BIMSunLevel/3.2"); c.setRequestProperty("Accept", "*/*");
+                    c.setRequestProperty("User-Agent", "BIMSunLevel/3.3"); c.setRequestProperty("Accept", "*/*");
                     if (c.getResponseCode() == 200) {
                         BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8));
                         StringBuilder sb = new StringBuilder(); String l;
@@ -532,22 +556,57 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     }
 
     private void showToolsMenu() {
-        CharSequence[] items = {"1. Поиск адреса или ввод координат", "2. Импорт контура (.dxf / .ifc / .txt)",
-                "3. Тара уклономера (0.0°)", "4. Смена темы (Темная / Дневная)", "5. Смена сезона", "6. Фото AR в Галерею", "7. Экспорт в CSV"};
+        CharSequence[] items = {
+                "1. Поиск адреса или ввод координат",
+                "2. Импорт контура (.dxf / .ifc / .txt)",
+                "3. Настройка этажа и отметки H",
+                "4. Тара уклономера (0.0°)",
+                "5. Смена темы (Темная / Дневная)",
+                "6. Смена сезона (Лето / Зима / Равнод.)",
+                "7. Облачный BIM (Autodesk Viewer / APS)",
+                "8. Экспорт журнала в CSV"
+        };
         new AlertDialog.Builder(this).setTitle("BIM Инструменты").setItems(items, (d, w) -> {
             if (w == 0) showLocDialog();
             else if (w == 1) {
                 Intent i = new Intent(Intent.ACTION_GET_CONTENT); i.setType("*/*"); i.addCategory(Intent.CATEGORY_OPENABLE);
                 startActivityForResult(Intent.createChooser(i, "Файл DXF/IFC/TXT"), 202);
-            } else if (w == 2) { tarePitch = rawPitch; tareRoll = rawRoll; }
-            else if (w == 3) { isLightTheme = !isLightTheme; overlayView.invalidate(); }
-            else if (w == 4) {
+            } else if (w == 2) showAltitudeDialog();
+            else if (w == 3) { tarePitch = rawPitch; tareRoll = rawRoll; Toast.makeText(this, "Уровень обнулён (0.0°)", Toast.LENGTH_SHORT).show(); }
+            else if (w == 4) { isLightTheme = !isLightTheme; overlayView.invalidate(); }
+            else if (w == 5) {
                 selectedDay = (selectedDay == 80) ? 172 : (selectedDay == 172 ? 355 : (selectedDay == 355 ? Calendar.getInstance().get(Calendar.DAY_OF_YEAR) : 80));
                 seasonLabel = (selectedDay == 80) ? "21 Мар/Сен" : (selectedDay == 172 ? "21 Июня" : (selectedDay == 355 ? "21 Декабря" : "Сегодня"));
                 overlayView.invalidate();
-            } else if (w == 5) captureARPhoto();
-            else if (w == 6) exportCsv();
+            } else if (w == 6) showCloudBimDialog();
+            else if (w == 7) exportCsv();
         }).show();
+    }
+
+    private void showCloudBimDialog() {
+        final EditText in = new EditText(this);
+        in.setHint("Ссылка на модель Autodesk Viewer / APS");
+        in.setText(cloudBimUrl);
+        new AlertDialog.Builder(this).setTitle("Облачный BIM (APS / NWD-NWC)").setView(in)
+                .setPositiveButton("Открыть модель", (d, w) -> {
+                    cloudBimUrl = in.getText().toString().trim();
+                    if (!cloudBimUrl.startsWith("http")) cloudBimUrl = "https://" + cloudBimUrl;
+                    getSharedPreferences("osm_cache_v8", MODE_PRIVATE).edit().putString("bim_url", cloudBimUrl).apply();
+                    try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(cloudBimUrl))); } catch (Exception ignored) {}
+                }).setNegativeButton("Отмена", null).show();
+    }
+
+    private void showDefectPhotoDialog() {
+        final EditText in = new EditText(this);
+        in.setHint("Оси и замечание (напр: Оси А-Ж, фасад)");
+        in.setText(lastDefectStamp);
+        new AlertDialog.Builder(this).setTitle("Фотофиксация со штампом осей").setView(in)
+                .setPositiveButton("Снять фото AR", (d, w) -> {
+                    lastDefectStamp = in.getText().toString().trim();
+                    captureARPhoto(lastDefectStamp);
+                })
+                .setNeutralButton("Без текста", (d, w) -> captureARPhoto(""))
+                .setNegativeButton("Отмена", null).show();
     }
 
     private void showLocDialog() {
@@ -564,7 +623,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                         new Thread(() -> {
                             try {
                                 HttpURLConnection c = (HttpURLConnection) new URL("https://nominatim.openstreetmap.org/search?format=json&limit=1&q=" + URLEncoder.encode(q, "UTF-8")).openConnection();
-                                c.setRequestProperty("User-Agent", "BIMSunLevel/3.2");
+                                c.setRequestProperty("User-Agent", "BIMSunLevel/3.3");
                                 BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream()));
                                 JSONArray a = new JSONArray(br.readLine()); br.close();
                                 if (a.length() > 0) {
@@ -582,7 +641,9 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     protected void onActivityResult(int req, int res, Intent data) {
         if (req == 202 && res == RESULT_OK && data != null && data.getData() != null) {
             try {
-                BufferedReader br = new BufferedReader(new InputStreamReader(getContentResolver().openInputStream(data.getData())));
+                InputStream is = getContentResolver().openInputStream(data.getData());
+                if (is == null) return;
+                BufferedReader br = new BufferedReader(new InputStreamReader(is));
                 List<String> lines = new ArrayList<>(); String l;
                 while ((l = br.readLine()) != null) lines.add(l.trim());
                 br.close();
@@ -623,12 +684,13 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     }
 
     private OutputStream openDownloadStream(String name, String mime) throws Exception {
+        lastCreatedUri = null;
         if (Build.VERSION.SDK_INT >= 29) {
             ContentValues cv = new ContentValues();
             cv.put(MediaStore.Downloads.DISPLAY_NAME, name); cv.put(MediaStore.Downloads.MIME_TYPE, mime);
             cv.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/BIM_Reports");
             Uri u = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
-            if (u != null) return getContentResolver().openOutputStream(u);
+            if (u != null) { lastCreatedUri = u; return getContentResolver().openOutputStream(u); }
         }
         File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "BIM_Reports");
         if (!dir.exists()) dir.mkdirs();
@@ -637,24 +699,44 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
 
     private void generatePdfReport() {
         try {
-            String name = "BIM_Act_" + System.currentTimeMillis() + ".pdf";
+            String name = "BIM_Act_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date()) + ".pdf";
             PdfDocument pdf = new PdfDocument();
             PdfDocument.Page page = pdf.startPage(new PdfDocument.PageInfo.Builder(595, 842, 1).create());
             Canvas c = page.getCanvas(); Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
-            p.setTextSize(15f); c.drawText("АКТ СТРОЙКОНТРОЛЯ И ИНСОЛЯЦИИ (BIM Sun & Level)", 40, 45, p);
-            p.setTextSize(11f);
+            p.setTextSize(15f); c.drawText("АКТ СТРОЙКОНТРОЛЯ И ИНСОЛЯЦИИ (BIM Sun & Level)", 40, 42, p);
+            p.setTextSize(10.5f);
             float[] ins = calcInsolation(latitude, selectedDay);
             int fl = Math.max(1, Math.round(relativeHeightMeters / floorHeightMeters) + 1);
-            c.drawText(String.format(Locale.US, "GPS: %.5f N, %.5f E | Отметка H: %+.2f м (~%d эт.)", latitude, longitude, relativeHeightMeters, fl), 40, 75, p);
+            c.drawText("Дата: " + new SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.US).format(new Date()) + " | " + lastDefectStamp, 40, 66, p);
+            c.drawText(String.format(Locale.US, "GPS: %.5f N, %.5f E | Азимут: %.1f° (%s) | Отметка H: %+.2f м (~%d эт.)",
+                    latitude, longitude, camAzimuth, getCardinal(camAzimuth), relativeHeightMeters, fl), 40, 86, p);
             c.drawText(String.format(Locale.US, "Уклон: %.2f° | Свет: %.0f лк | КЕО: %.2f%% | СанПиН: %.1f ч (%s)",
-                    rawPitch - tarePitch, currentLux, Math.max(0f, lastKeo), ins[1], ins[1] >= 2f ? "НОРМА" : "НАРУШЕНИЕ"), 40, 98, p);
+                    rawPitch - tarePitch, currentLux, Math.max(0f, lastKeo), ins[1], ins[1] >= 2f ? "НОРМА" : "НАРУШЕНИЕ"), 40, 106, p);
+            if (!lastTapeSummary.isEmpty()) c.drawText("AR-Рулетка (последний замер): " + lastTapeSummary, 40, 126, p);
+
             Bitmap bmp = Bitmap.createBitmap(overlayView.getWidth(), overlayView.getHeight(), Bitmap.Config.ARGB_8888);
             Canvas sc = new Canvas(bmp); sc.drawColor(Color.rgb(16, 24, 36)); overlayView.draw(sc);
-            c.drawBitmap(bmp, null, new Rect(40, 120, 555, 800), null); bmp.recycle();
+            c.drawBitmap(bmp, null, new Rect(40, 142, 555, 805), null); bmp.recycle();
             pdf.finishPage(page);
             OutputStream os = openDownloadStream(name, "application/pdf");
             pdf.writeTo(os); os.close(); pdf.close();
-            Toast.makeText(this, "PDF сохранен: Download/BIM_Reports/" + name, Toast.LENGTH_LONG).show();
+
+            final Uri shareUri = lastCreatedUri;
+            if (shareUri != null) {
+                new AlertDialog.Builder(this).setTitle("PDF-акт сохранён")
+                        .setMessage("Файл: Download/BIM_Reports/" + name + "\nОтправить отчёт в мессенджер или на почту?")
+                        .setPositiveButton("Отправить", (d, w) -> {
+                            Intent s = new Intent(Intent.ACTION_SEND);
+                            s.setType("application/pdf");
+                            s.putExtra(Intent.EXTRA_STREAM, shareUri);
+                            s.putExtra(Intent.EXTRA_SUBJECT, "Акт стройконтроля BIM Sun & Level");
+                            s.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                            startActivity(Intent.createChooser(s, "Отправить PDF-акт"));
+                        })
+                        .setNegativeButton("Закрыть", null).show();
+            } else {
+                Toast.makeText(this, "PDF сохранен: Download/BIM_Reports/" + name, Toast.LENGTH_LONG).show();
+            }
         } catch (Exception e) { Toast.makeText(this, "Ошибка PDF: " + e.getMessage(), Toast.LENGTH_SHORT).show(); }
     }
 
@@ -734,7 +816,12 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         return (t >= 0f && u >= 0f && u <= 1f) ? t : -1f;
     }
 
-    private void captureARPhoto() {
+    private String getCardinal(float az) {
+        String[] dirs = {"С", "СВ", "В", "ЮВ", "Ю", "ЮЗ", "З", "СЗ"};
+        return dirs[((Math.round(az / 45f) % 8) + 8) % 8];
+    }
+
+    private void captureARPhoto(final String note) {
         int w = overlayView.getWidth(), h = overlayView.getHeight();
         if (w <= 0 || h <= 0) return;
         if (!is2DMapMode && camera != null) {
@@ -749,28 +836,42 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                         Matrix m = new Matrix(); m.postRotate(90);
                         Bitmap rot = Bitmap.createBitmap(raw, 0, 0, raw.getWidth(), raw.getHeight(), m, true);
                         raw.recycle();
-                        savePhotoBmp(rot, w, h);
-                    } catch (Exception e) { savePhotoBmp(null, w, h); }
+                        savePhotoBmp(rot, w, h, note);
+                    } catch (Exception e) { savePhotoBmp(null, w, h, note); }
                 });
                 return;
             } catch (Exception ignored) {}
         }
-        savePhotoBmp(null, w, h);
+        savePhotoBmp(null, w, h, note);
     }
 
-    private void savePhotoBmp(Bitmap camBmp, int w, int h) {
+    private void savePhotoBmp(Bitmap camBmp, int w, int h, String note) {
         Bitmap b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
         Canvas c = new Canvas(b);
         if (camBmp != null) { c.drawBitmap(camBmp, null, new Rect(0, 0, w, h), null); camBmp.recycle(); }
         else c.drawColor(Color.rgb(16, 24, 36));
         overlayView.draw(c);
+
+        // Штамп осей, дефекта и компаса на фото
+        float ui = w / 1080f;
+        Paint sp = new Paint(Paint.ANTI_ALIAS_FLAG);
+        sp.setColor(Color.argb(220, 12, 18, 28));
+        c.drawRoundRect(new RectF(20 * ui, h - 255 * ui, w - 20 * ui, h - 165 * ui), 14 * ui, 14 * ui, sp);
+        sp.setColor(Color.rgb(255, 225, 80)); sp.setTextSize(24 * ui);
+        String ts = new SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.US).format(new Date());
+        int fl = Math.max(1, Math.round(relativeHeightMeters / floorHeightMeters) + 1);
+        c.drawText(String.format(Locale.US, "%s | Азимут %.0f° (%s) | %d эт (%+.1fм)", ts, camAzimuth, getCardinal(camAzimuth), fl, relativeHeightMeters), 36 * ui, h - 218 * ui, sp);
+        sp.setColor(Color.WHITE);
+        c.drawText(note.isEmpty() ? String.format(Locale.US, "GPS: %.5f, %.5f", latitude, longitude) : ("ШТАМП: " + note), 36 * ui, h - 182 * ui, sp);
+
         try {
             ContentValues cv = new ContentValues();
             cv.put(MediaStore.Images.Media.DISPLAY_NAME, "BIM_" + System.currentTimeMillis() + ".jpg");
             cv.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+            if (Build.VERSION.SDK_INT >= 29) cv.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/BIM_SunLevel");
             Uri u = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv);
             if (u != null) { OutputStream os = getContentResolver().openOutputStream(u); b.compress(Bitmap.CompressFormat.JPEG, 92, os); os.close(); }
-            Toast.makeText(this, "Сохранено в Галерею", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "Фото со штампом сохранено в Галерею", Toast.LENGTH_SHORT).show();
         } catch (Exception ignored) {}
         b.recycle();
     }
@@ -834,6 +935,11 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         if (locationManager != null) try { locationManager.removeUpdates(locListener); } catch (Exception ignored) {}
     }
 
+    @Override protected void onDestroy() {
+        super.onDestroy();
+        if (toneGen != null) try { toneGen.release(); } catch (Exception ignored) {}
+    }
+
     @Override public void onSensorChanged(SensorEvent e) {
         int t = e.sensor.getType();
         if (t == Sensor.TYPE_ROTATION_VECTOR || t == Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR) {
@@ -842,6 +948,14 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             System.arraycopy(e.values, 0, lastAcc, 0, 3); hasAcc = true;
             rawPitch += 0.12f * ((float) Math.toDegrees(Math.atan2(e.values[1], Math.sqrt(e.values[0] * e.values[0] + e.values[2] * e.values[2]))) - rawPitch);
             rawRoll += 0.12f * ((float) Math.toDegrees(Math.atan2(-e.values[0], Math.sqrt(e.values[1] * e.values[1] + e.values[2] * e.values[2]))) - rawRoll);
+            float cp = Math.abs(rawPitch - tarePitch), cr = Math.abs(rawRoll - tareRoll);
+            if (cp < 0.5f && cr < 0.5f && !wasLevel) {
+                wasLevel = true;
+                if (overlayView != null) overlayView.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+                if (toneGen != null) try { toneGen.startTone(ToneGenerator.TONE_PROP_BEEP, 65); } catch (Exception ignored) {}
+            } else if (cp > 1.2f || cr > 1.2f) {
+                wasLevel = false;
+            }
             if (!hasRotVec && hasMag && SensorManager.getRotationMatrix(rotMat, null, lastAcc, lastMag)) applyRot();
         } else if (t == Sensor.TYPE_MAGNETIC_FIELD) {
             System.arraycopy(e.values, 0, lastMag, 0, 3); hasMag = true;
@@ -891,9 +1005,25 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             if (is2DMapMode) {
                 c.drawColor(isLightTheme ? Color.rgb(238, 242, 247) : Color.rgb(14, 22, 34));
                 draw2D(c, w, h, ui, sun);
-            } else drawAR(c, w, h, ui, sun);
+            } else {
+                drawAR(c, w, h, ui, sun);
+            }
+            drawQuickFloorButtons(c, w, ui);
             if (showKeoHeatmap) drawKeoMap(c, ui);
             drawHeader(c, w, ui, sun);
+        }
+
+        private void drawQuickFloorButtons(Canvas c, int w, float ui) {
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(Color.argb(200, 30, 55, 85));
+            c.drawRoundRect(new RectF(w - 145 * ui, 555 * ui, w - 22 * ui, 635 * ui), 14 * ui, 14 * ui, paint);
+            c.drawRoundRect(new RectF(w - 145 * ui, 645 * ui, w - 22 * ui, 725 * ui), 14 * ui, 14 * ui, paint);
+            paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(2 * ui); paint.setColor(Color.rgb(110, 210, 255));
+            c.drawRoundRect(new RectF(w - 145 * ui, 555 * ui, w - 22 * ui, 635 * ui), 14 * ui, 14 * ui, paint);
+            c.drawRoundRect(new RectF(w - 145 * ui, 645 * ui, w - 22 * ui, 725 * ui), 14 * ui, 14 * ui, paint);
+            paint.setStyle(Paint.Style.FILL); paint.setColor(Color.WHITE); paint.setTextSize(23 * ui);
+            c.drawText("▲ Эт", w - 118 * ui, 604 * ui, paint);
+            c.drawText("▼ Эт", w - 118 * ui, 694 * ui, paint);
         }
 
         private void draw2D(Canvas c, int w, int h, float ui, double[] sun) {
@@ -901,7 +1031,13 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(1.5f * ui); paint.setColor(Color.argb(80, 100, 140, 180));
             c.drawLine(0, cy, w, cy, paint); c.drawLine(cx, 390 * ui, cx, h - 180 * ui, paint);
             for (int r : new int[]{50, 100, 150, 200}) c.drawCircle(cx, cy, r * sc, paint);
-            paint.setStyle(Paint.Style.FILL); paint.setColor(Color.argb(45, 0, 255, 180));
+
+            paint.setStyle(Paint.Style.FILL); paint.setColor(Color.rgb(0, 225, 175)); paint.setTextSize(24 * ui);
+            c.drawText("СЕВЕР (С)", cx - 55 * ui, 420 * ui, paint);
+            c.drawText("ЮГ (Ю)", cx - 38 * ui, h - 220 * ui, paint);
+            c.drawText("З", 18 * ui, cy - 8 * ui, paint); c.drawText("В", w - 38 * ui, cy - 8 * ui, paint);
+
+            paint.setColor(Color.argb(45, 0, 255, 180));
             c.drawArc(new RectF(cx - 120 * sc, cy - 120 * sc, cx + 120 * sc, cy + 120 * sc), camAzimuth - 120f, 60f, true, paint);
 
             float shX = (float) Math.sin(Math.toRadians(sun[0] + 180.0)), shY = (float) Math.cos(Math.toRadians(sun[0] + 180.0));
@@ -959,10 +1095,19 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                     }
                 }
             }
+
+            // Горизонт и шкала компаса AR
             float hy = cy + (camAltitude / fV) * h;
             paint.setColor(Color.argb(180, 0, 255, 180)); c.drawLine(0, hy, w, hy, paint);
+            String[] dirs = {"С (0°)", "СВ", "В (90°)", "ЮВ", "Ю (180°)", "ЮЗ", "З (270°)", "СЗ"};
+            paint.setStyle(Paint.Style.FILL); paint.setTextSize(26 * ui);
+            for (int i = 0; i < 8; i++) {
+                float dx = azToX(i * 45f, w, fH);
+                if (dx >= -40 && dx <= w + 40) { c.drawCircle(dx, hy, 6 * ui, paint); c.drawText(dirs[i], dx - 30 * ui, hy - 14 * ui, paint); }
+            }
 
-            path.reset(); boolean st = false; paint.setColor(Color.YELLOW); paint.setStrokeWidth(5f * ui);
+            // Дуга солнца
+            path.reset(); boolean st = false; paint.setStyle(Paint.Style.STROKE); paint.setColor(Color.YELLOW); paint.setStrokeWidth(5f * ui);
             for (double hr = 5.0; hr <= 21.0; hr += 0.5) {
                 double[] p = computeSun(latitude, selectedDay, hr); if (p[1] < -5) continue;
                 float sx = azToX((float) p[0], w, fH), sy = cy - (((float) p[1] - camAltitude) / fV) * h;
@@ -970,9 +1115,17 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             }
             c.drawPath(path, paint);
 
-            float r = 85f * ui, calP = rawPitch - tarePitch;
-            paint.setColor(Math.abs(calP) < 0.5f ? Color.GREEN : Color.WHITE);
+            // Мини-радар / Компас в правом верхнем углу AR
+            drawMiniRadar(c, w, ui, sun[0]);
+
+            // Пузырьковый уровень
+            float r = 85f * ui, calP = rawPitch - tarePitch, calR = rawRoll - tareRoll;
+            boolean ok = Math.abs(calP) < 0.5f && Math.abs(calR) < 0.5f;
+            paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(3.5f * ui);
+            paint.setColor(ok ? Color.GREEN : Color.WHITE);
             c.drawCircle(cx, cy, r, paint); c.drawLine(cx - r - 20 * ui, cy, cx + r + 20 * ui, cy, paint); c.drawLine(cx, cy - r - 20 * ui, cx, cy + r + 20 * ui, paint);
+            paint.setStyle(Paint.Style.FILL); paint.setColor(ok ? Color.argb(210, 0, 255, 100) : Color.argb(210, 255, 180, 0));
+            c.drawCircle(cx + Math.max(-r, Math.min(r, (calR / 15f) * r)), cy + Math.max(-r, Math.min(r, (calP / 15f) * r)), 16 * ui, paint);
 
             if (tapeMode > 0) {
                 float eAz = tapeAz2 != null ? tapeAz2 : camAzimuth, eAlt = tapeAlt2 != null ? tapeAlt2 : camAltitude;
@@ -999,6 +1152,36 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             }
         }
 
+        private void drawMiniRadar(Canvas c, int w, float ui, double sunAz) {
+            float rx = w - 90f * ui, ry = 468f * ui, rad = 68f * ui;
+            paint.setStyle(Paint.Style.FILL); paint.setColor(Color.argb(195, 14, 22, 34));
+            c.drawCircle(rx, ry, rad, paint);
+            paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(2.5f * ui); paint.setColor(Color.rgb(0, 230, 180));
+            c.drawCircle(rx, ry, rad, paint);
+
+            // Точки домов OSM на радаре
+            paint.setStyle(Paint.Style.FILL); paint.setColor(Color.argb(170, 120, 195, 255));
+            double rotR = Math.toRadians(-camAzimuth);
+            synchronized (osmBuildings) {
+                for (OsmBuilding b : osmBuildings) {
+                    if (b.xMeters.length > 0) {
+                        float bx = b.xMeters[0] * 0.42f * ui, by = b.yMeters[0] * 0.42f * ui;
+                        float px = (float) (bx * Math.cos(rotR) - by * Math.sin(rotR));
+                        float py = (float) (bx * Math.sin(rotR) + by * Math.cos(rotR));
+                        if (Math.hypot(px, py) < rad - 10 * ui) c.drawCircle(rx + px, ry - py, 3.5f * ui, paint);
+                    }
+                }
+            }
+            // Вращающаяся метка Севера (N) и точка Солнца
+            double nR = Math.toRadians(-camAzimuth - 90.0), sR = Math.toRadians(sunAz - camAzimuth - 90.0);
+            paint.setColor(Color.rgb(255, 75, 75)); paint.setTextSize(20 * ui);
+            c.drawText("N", rx + (float) Math.cos(nR) * (rad - 15 * ui) - 7 * ui, ry + (float) Math.sin(nR) * (rad - 15 * ui) + 7 * ui, paint);
+            paint.setColor(Color.YELLOW);
+            c.drawCircle(rx + (float) Math.cos(sR) * (rad - 14 * ui), ry + (float) Math.sin(sR) * (rad - 14 * ui), 8 * ui, paint);
+            paint.setColor(Color.rgb(0, 255, 140));
+            c.drawCircle(rx, ry, 4.5f * ui, paint);
+        }
+
         private void drawKeoMap(Canvas c, float ui) {
             paint.setStyle(Paint.Style.FILL); paint.setColor(Color.argb(215, 16, 22, 32));
             c.drawRoundRect(new RectF(24 * ui, 400 * ui, 345 * ui, 540 * ui), 14 * ui, 14 * ui, paint);
@@ -1017,8 +1200,9 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             paint.setStyle(Paint.Style.FILL);
             paint.setColor(isLightTheme ? Color.argb(235, 250, 252, 255) : Color.argb(205, 14, 20, 28));
             c.drawRoundRect(new RectF(16 * ui, 20 * ui, w - 16 * ui, 385 * ui), 20 * ui, 20 * ui, paint);
-            paint.setColor(isLightTheme ? Color.BLACK : Color.WHITE); paint.setTextSize(26.5f * ui);
-            c.drawText(String.format(Locale.US, "Азимут: %.1f° | Солнце: Аз %.0f° Выс %.0f°", camAzimuth, sun[0], sun[1]), 34 * ui, 62 * ui, paint);
+            paint.setColor(isLightTheme ? Color.BLACK : Color.WHITE); paint.setTextSize(26f * ui);
+            c.drawText(String.format(Locale.US, "Азимут: %.1f° (%s) | Солнце: Аз %.0f° Выс %.0f°",
+                    camAzimuth, getCardinal(camAzimuth), sun[0], sun[1]), 34 * ui, 62 * ui, paint);
 
             float calP = rawPitch - tarePitch, pct = (float) (Math.tan(Math.toRadians(Math.abs(calP))) * 100.0);
             paint.setColor(Math.abs(calP) < 0.5f ? Color.rgb(0, 170, 70) : Color.rgb(255, 210, 70));
@@ -1038,8 +1222,8 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             paint.setTextSize(22.5f * ui); paint.setColor(gpsLocked ? Color.rgb(0, 160, 80) : Color.rgb(220, 130, 20));
             c.drawText(String.format(Locale.US, "%.4f N, %.4f E [%s] | %s", latitude, longitude, gpsLocked ? "GPS ОК" : "Поиск GPS", osmStatus), 34 * ui, 300 * ui, paint);
             paint.setColor(isLightTheme ? Color.DKGRAY : Color.rgb(150, 205, 255));
-            c.drawText(seasonLabel + " | Тап по Отметке H = коррекция этажа", 34 * ui, 340 * ui, paint);
-            c.drawText("Рулетка = 3D замер | Меню BIM = поиск адреса и DXF", 34 * ui, 372 * ui, paint);
+            c.drawText(seasonLabel + " | Кнопки справа ▲/▼ = быстрая смена этажа", 34 * ui, 340 * ui, paint);
+            c.drawText("Фото = штамп осей | Акт PDF = сохранение + отправка", 34 * ui, 372 * ui, paint);
         }
 
         private float azToX(float az, int w, float fH) {
