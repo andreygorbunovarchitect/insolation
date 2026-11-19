@@ -66,8 +66,10 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.TimeZone;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -101,6 +103,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private float gpsAcc = 0f, lastGpsAltASL = 0f;
     private boolean gpsLocked = false, realOsmLoaded = false;
     private volatile boolean pendingOsmReload = false;
+    private long lastOsmAttemptMs = 0L;
 
     private float camAzimuth = 0f, camAltitude = 0f, camRoll = 0f;
     private float rawPitch = 0f, rawRoll = 0f, tarePitch = 0f, tareRoll = 0f;
@@ -120,8 +123,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
     private String cloudBimUrl = "https://viewer.autodesk.com/";
     private Uri lastCreatedUri = null;
 
-    private final List<float[]> customPoly = new ArrayList<>();
-    private float customProjHeight = 24.0f;
+    private final List<OsmBuilding> customBuildings = new ArrayList<>();
     private boolean isLightTheme = false, isLiveTime = true, is2DMapMode = false;
     private int selectedDay = 80;
     private String seasonLabel = "Сегодня";
@@ -158,17 +160,15 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             if (ev.getAction() != MotionEvent.ACTION_DOWN) return false;
             float tx = ev.getX(), ty = ev.getY(), ui = v.getWidth() / 1080f;
 
-            // Быстрые кнопки [▲ Эт] и [▼ Эт] справа под мини-радаром
             if (tx >= v.getWidth() - 150 * ui && ty >= 555 * ui && ty <= 635 * ui) { adjustFloorStep(1); return true; }
             if (tx >= v.getWidth() - 150 * ui && ty >= 645 * ui && ty <= 725 * ui) { adjustFloorStep(-1); return true; }
-
             if (ty >= 120 * ui && ty <= 195 * ui) { showAltitudeDialog(); return true; }
             if (ty < 385 * ui) {
                 startLocationUpdates();
                 isFetchingOsm.set(false);
-                fetchOsmBuildings(latitude, longitude);
+                fetchOsmBuildings(latitude, longitude, true);
                 fetchAutoGroundMeteo(latitude, longitude);
-                Toast.makeText(this, "Обновление GPS, рельефа и OSM...", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, "Обновление карты (бесплатные серверы)...", Toast.LENGTH_SHORT).show();
                 return true;
             }
             if (tapeMode > 0 && !is2DMapMode && ty >= v.getHeight() - 360 * ui && ty <= v.getHeight() - 190 * ui) {
@@ -239,7 +239,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             is2DMapMode = !is2DMapMode;
             btnModeToggle.setText(is2DMapMode ? "Камера AR" : "2D План");
             if (!is2DMapMode && cameraSurface.getHolder().getSurface().isValid()) startCameraPreview(cameraSurface.getHolder());
-            if (!realOsmLoaded) fetchOsmBuildings(latitude, longitude);
+            if (!realOsmLoaded) fetchOsmBuildings(latitude, longitude, true);
             overlayView.invalidate();
         });
         bar.addView(btnModeToggle);
@@ -315,13 +315,9 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             try {
                 URL u = new URL(String.format(Locale.US, "https://api.open-meteo.com/v1/forecast?latitude=%.5f&longitude=%.5f&current=surface_pressure", lat, lon));
                 c = (HttpURLConnection) u.openConnection();
-                c.setConnectTimeout(6000); c.setReadTimeout(6000);
+                c.setConnectTimeout(5000); c.setReadTimeout(6000);
                 if (c.getResponseCode() == 200) {
-                    BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8));
-                    StringBuilder sb = new StringBuilder(); String l;
-                    while ((l = br.readLine()) != null) sb.append(l);
-                    br.close();
-                    JSONObject r = new JSONObject(sb.toString());
+                    JSONObject r = new JSONObject(readStreamAll(c.getInputStream()));
                     if (r.has("elevation")) autoGroundElevationASL = (float) r.getDouble("elevation");
                     JSONObject cur = r.optJSONObject("current");
                     if (cur != null && cur.has("surface_pressure")) autoGroundPressure = (float) cur.getDouble("surface_pressure");
@@ -359,7 +355,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         final EditText inSt = new EditText(this);
         inSt.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
         inSt.setText(String.format(Locale.US, "%.1f", floorHeightMeters));
-
         TextView t1 = new TextView(this); t1.setText("Текущий этаж:"); lay.addView(t1); lay.addView(inFl);
         TextView t2 = new TextView(this); t2.setText("Высота этажа (м):"); lay.addView(t2); lay.addView(inSt);
 
@@ -446,7 +441,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
 
     private void loadSavedState() {
         try {
-            SharedPreferences p = getSharedPreferences("osm_cache_v8", MODE_PRIVATE);
+            SharedPreferences p = getSharedPreferences("osm_cache_v10", MODE_PRIVATE);
             if (p.contains("lat")) {
                 latitude = Double.longBitsToDouble(p.getLong("lat", Double.doubleToRawLongBits(latitude)));
                 longitude = Double.longBitsToDouble(p.getLong("lon", Double.doubleToRawLongBits(longitude)));
@@ -456,155 +451,338 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             if (j != null) {
                 rawOsmCache = j;
                 int c = parseOsmJson(j, latitude, longitude);
-                if (c > 0) { realOsmLoaded = true; lastOsmLat = latitude; lastOsmLon = longitude; osmStatus = "OSM (кэш): " + c + " домов"; }
+                if (c > 0) { realOsmLoaded = true; lastOsmLat = latitude; lastOsmLon = longitude; osmStatus = "Кэш: " + c + " домов"; }
             }
         } catch (Exception ignored) {}
     }
 
-    private void fetchOsmBuildings(final double lat, final double lon) {
+    // --- 4 бесплатных источника без API-ключей: 1) VK/Mail.ru OSM (РФ), 2) OSM API v0.6, 3-4) Overpass EU ---
+    private void fetchOsmBuildings(final double lat, final double lon, boolean force) {
+        long now = System.currentTimeMillis();
+        if (!force && (now - lastOsmAttemptMs < 12000L)) return;
         if (!isFetchingOsm.compareAndSet(false, true)) { pendingOsmReload = true; return; }
-        pendingOsmReload = false; osmStatus = "Загрузка OSM...";
+        lastOsmAttemptMs = now;
+        pendingOsmReload = false;
+        osmStatus = "Загрузка домов...";
         if (overlayView != null) overlayView.postInvalidate();
 
         new Thread(() -> {
-            double s = lat - 0.0028, n = lat + 0.0028, w = lon - 0.0045, e = lon + 0.0045;
-            String q = String.format(Locale.US, "[out:json][timeout:18];(way[\"building\"](%.5f,%.5f,%.5f,%.5f);relation[\"building\"](%.5f,%.5f,%.5f,%.5f););out geom;", s, w, n, e, s, w, n, e);
-            String[] eps = {"https://overpass.private.coffee/api/interpreter", "https://maps.mail.ru/osm/tools/overpass/api/interpreter", "https://overpass-api.de/api/interpreter"};
-            boolean ok = false; int cnt = 0;
-            for (String ep : eps) {
-                HttpURLConnection c = null;
+            double s = lat - 0.0017, n = lat + 0.0017, w = lon - 0.0027, e = lon + 0.0027;
+            boolean ok = false;
+            int cnt = 0;
+            String srcName = "";
+            StringBuilder errLog = new StringBuilder();
+            String q = String.format(Locale.US, "[out:json][timeout:14];way[\"building\"](%.5f,%.5f,%.5f,%.5f);out geom;", s, w, n, e);
+
+            // Шаг 1: Бесплатное зеркало VK/Mail.ru Overpass (быстро работает в РФ без VPN)
+            int r1 = tryOverpassPost("https://maps.mail.ru/osm/tools/overpass/api/interpreter", q, lat, lon, "VK", errLog);
+            if (r1 > 0) { ok = true; cnt = r1; srcName = "OSM/VK"; }
+
+            // Шаг 2: Официальный бесплатный OSM API v0.6 JSON (без Overpass, с поддержкой relation-домов)
+            if (!ok) {
+                HttpURLConnection c0 = null;
                 try {
-                    c = (HttpURLConnection) new URL(ep + "?data=" + URLEncoder.encode(q, "UTF-8")).openConnection();
-                    c.setConnectTimeout(7000); c.setReadTimeout(10000);
-                    c.setRequestProperty("User-Agent", "BIMSunLevel/3.3"); c.setRequestProperty("Accept", "*/*");
-                    if (c.getResponseCode() == 200) {
-                        BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8));
-                        StringBuilder sb = new StringBuilder(); String l;
-                        while ((l = br.readLine()) != null) sb.append(l);
-                        br.close();
-                        rawOsmCache = sb.toString();
-                        cnt = parseOsmJson(rawOsmCache, latitude, longitude);
-                        lastOsmLat = lat; lastOsmLon = lon; realOsmLoaded = true; ok = true;
-                        getSharedPreferences("osm_cache_v8", MODE_PRIVATE).edit().putString("json", rawOsmCache)
-                                .putLong("lat", Double.doubleToRawLongBits(lat)).putLong("lon", Double.doubleToRawLongBits(lon)).apply();
-                        break;
-                    }
-                } catch (Exception ignored) {} finally { if (c != null) c.disconnect(); }
+                    String osmUrl = String.format(Locale.US, "https://api.openstreetmap.org/api/0.6/map.json?bbox=%.5f,%.5f,%.5f,%.5f", w, s, e, n);
+                    c0 = (HttpURLConnection) new URL(osmUrl).openConnection();
+                    c0.setInstanceFollowRedirects(true);
+                    c0.setConnectTimeout(5500); c0.setReadTimeout(9000);
+                    c0.setRequestProperty("User-Agent", "BIMSunLevel/3.5 (Android)");
+                    c0.setRequestProperty("Accept", "application/json");
+                    int code = c0.getResponseCode();
+                    if (code == 200) {
+                        String json = readStreamAll(c0.getInputStream());
+                        int found = parseOsmJson(json, latitude, longitude);
+                        if (found > 0) {
+                            saveOsmOk(json, lat, lon);
+                            ok = true; cnt = found; srcName = "OSM v0.6";
+                        } else errLog.append("OSM:0 ");
+                    } else errLog.append("OSM:").append(code).append(" ");
+                } catch (Exception ex) {
+                    errLog.append("OSM:").append(ex.getClass().getSimpleName().replace("Exception", "")).append(" ");
+                } finally { if (c0 != null) c0.disconnect(); }
             }
+
+            // Шаг 3-4: Бесплатные европейские зеркала Overpass (идеально при включённом VPN)
+            if (!ok) {
+                int r2 = tryOverpassPost("https://overpass-api.de/api/interpreter", q, lat, lon, "DE", errLog);
+                if (r2 > 0) { ok = true; cnt = r2; srcName = "OSM/DE"; }
+            }
+            if (!ok) {
+                int r3 = tryOverpassPost("https://overpass.private.coffee/api/interpreter", q, lat, lon, "AT", errLog);
+                if (r3 > 0) { ok = true; cnt = r3; srcName = "OSM/AT"; }
+            }
+
             isFetchingOsm.set(false);
-            if (pendingOsmReload) { fetchOsmBuildings(latitude, longitude); return; }
-            final boolean fOk = ok; final int fCnt = cnt;
+            if (pendingOsmReload) { fetchOsmBuildings(latitude, longitude, true); return; }
+            final boolean fOk = ok; final int fCnt = cnt; final String fSrc = srcName; final String fErr = errLog.toString().trim();
             runOnUiThread(() -> {
-                osmStatus = fOk ? ("Карта OSM: " + fCnt + " домов") : "Сеть OSM — тапните сверху";
+                osmStatus = fOk ? (fSrc + ": " + fCnt + " домов") : ("Нет ответа (" + fErr + ")");
                 if (overlayView != null) overlayView.invalidate();
             });
         }).start();
     }
 
+    private int tryOverpassPost(String urlStr, String query, double lat, double lon, String tag, StringBuilder errLog) {
+        HttpURLConnection c = null;
+        try {
+            c = (HttpURLConnection) new URL(urlStr).openConnection();
+            c.setInstanceFollowRedirects(true);
+            c.setRequestMethod("POST");
+            c.setDoOutput(true);
+            c.setConnectTimeout(5000); c.setReadTimeout(8500);
+            c.setRequestProperty("User-Agent", "BIMSunLevel/3.5 (Android)");
+            c.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
+            c.setRequestProperty("Accept", "application/json, */*");
+            byte[] body = ("data=" + URLEncoder.encode(query, "UTF-8")).getBytes(StandardCharsets.UTF_8);
+            OutputStream os = c.getOutputStream();
+            os.write(body); os.flush(); os.close();
+
+            int code = c.getResponseCode();
+            if (code == 200) {
+                String json = readStreamAll(c.getInputStream());
+                int found = parseOsmJson(json, latitude, longitude);
+                if (found > 0) { saveOsmOk(json, lat, lon); return found; }
+                errLog.append(tag).append(":0 ");
+            } else errLog.append(tag).append(":").append(code).append(" ");
+        } catch (Exception ex) {
+            errLog.append(tag).append(":").append(ex.getClass().getSimpleName().replace("Exception", "")).append(" ");
+        } finally { if (c != null) c.disconnect(); }
+        return 0;
+    }
+
+    private void saveOsmOk(String json, double lat, double lon) {
+        rawOsmCache = json; lastOsmLat = lat; lastOsmLon = lon; realOsmLoaded = true;
+        getSharedPreferences("osm_cache_v10", MODE_PRIVATE).edit().putString("json", json)
+                .putLong("lat", Double.doubleToRawLongBits(lat)).putLong("lon", Double.doubleToRawLongBits(lon)).apply();
+    }
+
+    private String readStreamAll(InputStream is) throws Exception {
+        BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
+        StringBuilder sb = new StringBuilder(); String l;
+        while ((l = br.readLine()) != null) sb.append(l);
+        br.close();
+        return sb.toString();
+    }
+
+    // Парсер OSM v0.6 (nodes + ways + relation multipolygons) и Overpass (out geom)
     private int parseOsmJson(String json, double cLat, double cLon) throws Exception {
         JSONArray els = new JSONObject(json).optJSONArray("elements");
         if (els == null) return 0;
         double mLat = 111132.0, mLon = 111320.0 * Math.cos(Math.toRadians(cLat));
-        List<OsmBuilding> list = new ArrayList<>();
+
+        Map<Long, float[]> nodeMap = new HashMap<>();
+        Map<Long, JSONArray> wayNodesMap = new HashMap<>();
         for (int i = 0; i < els.length(); i++) {
-            JSONObject el = els.getJSONObject(i);
-            int lv = 5; float h = -1f; String num = "";
-            JSONObject t = el.optJSONObject("tags");
-            if (t != null) {
-                num = t.optString("addr:housenumber", "").trim();
-                String ls = t.optString("building:levels", "").replaceAll("[^0-9]", "");
-                if (!ls.isEmpty()) try { lv = Integer.parseInt(ls); } catch (Exception ignored) {}
-                String hs = t.optString("height", "").replace(",", ".").replaceAll("[^0-9.]", "");
-                if (!hs.isEmpty()) try { h = Float.parseFloat(hs); } catch (Exception ignored) {}
-            }
-            if (h <= 2f) h = lv * 3.0f;
-            JSONArray g = el.optJSONArray("geometry");
-            if (g != null && g.length() >= 3) list.add(mkGeomBld(g, cLat, cLon, mLat, mLon, lv, h, num));
-            JSONArray mem = el.optJSONArray("members");
-            if (mem != null) {
-                for (int m = 0; m < mem.length(); m++) {
-                    JSONObject mo = mem.getJSONObject(m);
-                    JSONArray mg = mo.optJSONArray("geometry");
-                    if ("outer".equals(mo.optString("role", "outer")) && mg != null && mg.length() >= 3)
-                        list.add(mkGeomBld(mg, cLat, cLon, mLat, mLon, lv, h, num));
-                }
+            JSONObject el = els.optJSONObject(i);
+            if (el == null) continue;
+            String type = el.optString("type");
+            if ("node".equals(type) && el.has("lat") && el.has("lon")) {
+                nodeMap.put(el.optLong("id"), new float[]{(float) ((el.optDouble("lon") - cLon) * mLon), (float) ((el.optDouble("lat") - cLat) * mLat)});
+            } else if ("way".equals(type) && el.has("nodes")) {
+                wayNodesMap.put(el.optLong("id"), el.optJSONArray("nodes"));
             }
         }
-        synchronized (osmBuildings) {
-            osmBuildings.clear(); osmBuildings.addAll(list);
-            if (customPoly.size() >= 3) {
-                OsmBuilding p = new OsmBuilding();
-                p.xMeters = new float[customPoly.size()]; p.yMeters = new float[customPoly.size()];
-                for (int i = 0; i < customPoly.size(); i++) { p.xMeters[i] = customPoly.get(i)[0]; p.yMeters[i] = customPoly.get(i)[1]; }
-                p.heightMeters = customProjHeight; p.levels = Math.round(customProjHeight / 3f); p.houseNumber = "ПРОЕКТ"; p.isCustom = true;
-                osmBuildings.add(p);
+
+        List<OsmBuilding> list = new ArrayList<>();
+        for (int i = 0; i < els.length(); i++) {
+            try {
+                JSONObject el = els.optJSONObject(i);
+                if (el == null) continue;
+                String type = el.optString("type");
+                JSONObject t = el.optJSONObject("tags");
+                if (t == null || (!t.has("building") && !t.has("building:part"))) continue;
+
+                int lv = 5; float h = -1f;
+                String num = t.optString("addr:housenumber", "").trim();
+                String ls = t.optString("building:levels", "").replaceAll("[^0-9]", "");
+                if (!ls.isEmpty()) try { lv = Math.max(1, Integer.parseInt(ls)); } catch (Exception ignored) {}
+                String hs = t.optString("height", "").replace(",", ".").replaceAll("[^0-9.]", "");
+                if (!hs.isEmpty()) try { h = Float.parseFloat(hs); } catch (Exception ignored) {}
+                if (h <= 2f) h = lv * 3.0f;
+
+                if ("way".equals(type)) {
+                    List<float[]> pts = extractWayPts(el, nodeMap, cLat, cLon, mLat, mLon);
+                    if (pts.size() >= 3) list.add(buildFromPts(pts, lv, h, num, false));
+                } else if ("relation".equals(type)) {
+                    JSONArray mems = el.optJSONArray("members");
+                    if (mems != null) {
+                        for (int m = 0; m < mems.length(); m++) {
+                            JSONObject mem = mems.optJSONObject(m);
+                            if (mem != null && "way".equals(mem.optString("type")) && !"inner".equals(mem.optString("role"))) {
+                                JSONArray nds = wayNodesMap.get(mem.optLong("ref"));
+                                if (nds != null && nds.length() >= 3) {
+                                    List<float[]> pts = new ArrayList<>();
+                                    for (int j = 0; j < nds.length(); j++) {
+                                        float[] xy = nodeMap.get(nds.optLong(j));
+                                        if (xy != null) pts.add(xy);
+                                    }
+                                    if (pts.size() >= 3) list.add(buildFromPts(pts, lv, h, num, false));
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
+
+        if (!list.isEmpty()) {
+            synchronized (osmBuildings) {
+                osmBuildings.clear();
+                osmBuildings.addAll(list);
+                osmBuildings.addAll(customBuildings);
             }
         }
         return list.size();
     }
 
-    private OsmBuilding mkGeomBld(JSONArray g, double cLat, double cLon, double mLat, double mLon, int lv, float h, String num) throws Exception {
-        OsmBuilding b = new OsmBuilding();
-        b.xMeters = new float[g.length()]; b.yMeters = new float[g.length()];
-        for (int j = 0; j < g.length(); j++) {
-            JSONObject pt = g.getJSONObject(j);
-            b.xMeters[j] = (float) ((pt.getDouble("lon") - cLon) * mLon);
-            b.yMeters[j] = (float) ((pt.getDouble("lat") - cLat) * mLat);
+    private List<float[]> extractWayPts(JSONObject el, Map<Long, float[]> nodeMap, double cLat, double cLon, double mLat, double mLon) {
+        List<float[]> pts = new ArrayList<>();
+        JSONArray g = el.optJSONArray("geometry");
+        if (g != null && g.length() >= 3) {
+            for (int j = 0; j < g.length(); j++) {
+                JSONObject pt = g.optJSONObject(j);
+                if (pt != null && pt.has("lat") && pt.has("lon"))
+                    pts.add(new float[]{(float) ((pt.optDouble("lon") - cLon) * mLon), (float) ((pt.optDouble("lat") - cLat) * mLat)});
+            }
+        } else {
+            JSONArray nds = el.optJSONArray("nodes");
+            if (nds != null && nds.length() >= 3 && !nodeMap.isEmpty()) {
+                for (int j = 0; j < nds.length(); j++) {
+                    float[] xy = nodeMap.get(nds.optLong(j));
+                    if (xy != null) pts.add(xy);
+                }
+            }
         }
-        b.levels = lv; b.heightMeters = h; b.houseNumber = num;
+        return pts;
+    }
+
+    private OsmBuilding buildFromPts(List<float[]> pts, int lv, float h, String num, boolean custom) {
+        OsmBuilding b = new OsmBuilding();
+        b.xMeters = new float[pts.size()]; b.yMeters = new float[pts.size()];
+        for (int j = 0; j < pts.size(); j++) { b.xMeters[j] = pts.get(j)[0]; b.yMeters[j] = pts.get(j)[1]; }
+        b.levels = lv; b.heightMeters = h; b.houseNumber = num; b.isCustom = custom;
         return b;
+    }
+
+    // Оффлайн-импорт GeoJSON квартала (бесплатная выгрузка из Overpass Turbo / QGIS)
+    private int parseGeoJsonFile(String text) throws Exception {
+        JSONArray feats = new JSONObject(text).optJSONArray("features");
+        if (feats == null) return 0;
+        double mLat = 111132.0, mLon = 111320.0 * Math.cos(Math.toRadians(latitude));
+        List<OsmBuilding> list = new ArrayList<>();
+        for (int i = 0; i < feats.length(); i++) {
+            JSONObject f = feats.optJSONObject(i); if (f == null) continue;
+            JSONObject geom = f.optJSONObject("geometry"); if (geom == null) continue;
+            JSONObject props = f.optJSONObject("properties");
+            int lv = 5; String num = "";
+            if (props != null) {
+                num = props.optString("addr:housenumber", props.optString("name", "")).trim();
+                String ls = props.optString("building:levels", props.optString("levels", "")).replaceAll("[^0-9]", "");
+                if (!ls.isEmpty()) try { lv = Math.max(1, Integer.parseInt(ls)); } catch (Exception ignored) {}
+            }
+            String gt = geom.optString("type");
+            JSONArray coords = geom.optJSONArray("coordinates");
+            if (coords == null) continue;
+            JSONArray ring = "Polygon".equals(gt) ? coords.optJSONArray(0)
+                    : ("MultiPolygon".equals(gt) && coords.optJSONArray(0) != null ? coords.optJSONArray(0).optJSONArray(0) : null);
+            if (ring != null && ring.length() >= 3) {
+                List<float[]> pts = new ArrayList<>();
+                for (int j = 0; j < ring.length(); j++) {
+                    JSONArray pt = ring.optJSONArray(j);
+                    if (pt != null && pt.length() >= 2)
+                        pts.add(new float[]{(float) ((pt.optDouble(0) - longitude) * mLon), (float) ((pt.optDouble(1) - latitude) * mLat)});
+                }
+                if (pts.size() >= 3) list.add(buildFromPts(pts, lv, lv * 3f, num, false));
+            }
+        }
+        if (!list.isEmpty()) {
+            synchronized (osmBuildings) { osmBuildings.clear(); osmBuildings.addAll(list); osmBuildings.addAll(customBuildings); }
+            realOsmLoaded = true; osmStatus = "GeoJSON: " + list.size() + " домов";
+        }
+        return list.size();
     }
 
     private void showToolsMenu() {
         CharSequence[] items = {
                 "1. Поиск адреса или ввод координат",
-                "2. Импорт контура (.dxf / .ifc / .txt)",
-                "3. Настройка этажа и отметки H",
-                "4. Тара уклономера (0.0°)",
-                "5. Смена темы (Темная / Дневная)",
-                "6. Смена сезона (Лето / Зима / Равнод.)",
-                "7. Облачный BIM (Autodesk Viewer / APS)",
-                "8. Экспорт журнала в CSV"
+                "2. + Добавить дом на план вручную (оффлайн)",
+                "3. Импорт файла (.geojson / .dxf / .ifc / .txt)",
+                "4. Настройка этажа и отметки H",
+                "5. Тара уклономера (0.0°)",
+                "6. Смена темы (Темная / Дневная)",
+                "7. Смена сезона (Лето / Зима / Равнод.)",
+                "8. Облачный BIM (Autodesk Viewer / APS)",
+                "9. Экспорт журнала в CSV"
         };
         new AlertDialog.Builder(this).setTitle("BIM Инструменты").setItems(items, (d, w) -> {
             if (w == 0) showLocDialog();
-            else if (w == 1) {
+            else if (w == 1) showAddManualBuildingDialog();
+            else if (w == 2) {
                 Intent i = new Intent(Intent.ACTION_GET_CONTENT); i.setType("*/*"); i.addCategory(Intent.CATEGORY_OPENABLE);
-                startActivityForResult(Intent.createChooser(i, "Файл DXF/IFC/TXT"), 202);
-            } else if (w == 2) showAltitudeDialog();
-            else if (w == 3) { tarePitch = rawPitch; tareRoll = rawRoll; Toast.makeText(this, "Уровень обнулён (0.0°)", Toast.LENGTH_SHORT).show(); }
-            else if (w == 4) { isLightTheme = !isLightTheme; overlayView.invalidate(); }
-            else if (w == 5) {
+                startActivityForResult(Intent.createChooser(i, "Файл GeoJSON/DXF/IFC"), 202);
+            } else if (w == 3) showAltitudeDialog();
+            else if (w == 4) { tarePitch = rawPitch; tareRoll = rawRoll; Toast.makeText(this, "Уровень обнулён (0.0°)", Toast.LENGTH_SHORT).show(); }
+            else if (w == 5) { isLightTheme = !isLightTheme; overlayView.invalidate(); }
+            else if (w == 6) {
                 selectedDay = (selectedDay == 80) ? 172 : (selectedDay == 172 ? 355 : (selectedDay == 355 ? Calendar.getInstance().get(Calendar.DAY_OF_YEAR) : 80));
                 seasonLabel = (selectedDay == 80) ? "21 Мар/Сен" : (selectedDay == 172 ? "21 Июня" : (selectedDay == 355 ? "21 Декабря" : "Сегодня"));
                 overlayView.invalidate();
-            } else if (w == 6) showCloudBimDialog();
-            else if (w == 7) exportCsv();
+            } else if (w == 7) showCloudBimDialog();
+            else if (w == 8) exportCsv();
         }).show();
+    }
+
+    // Оффлайн-добавление соседнего или проектируемого дома прямо по направлению камеры
+    private void showAddManualBuildingDialog() {
+        LinearLayout lay = new LinearLayout(this);
+        lay.setOrientation(LinearLayout.VERTICAL); lay.setPadding(45, 15, 45, 10);
+        final EditText inAz = new EditText(this); inAz.setHint("Азимут (°)"); inAz.setInputType(InputType.TYPE_CLASS_NUMBER);
+        inAz.setText(String.valueOf(Math.round(camAzimuth)));
+        final EditText inDist = new EditText(this); inDist.setHint("Дистанция до дома (м)"); inDist.setInputType(InputType.TYPE_CLASS_NUMBER);
+        inDist.setText("35");
+        final EditText inSize = new EditText(this); inSize.setHint("Длина и ширина дома (м)");
+        inSize.setText("35 15");
+        final EditText inFl = new EditText(this); inFl.setHint("Этажей"); inFl.setInputType(InputType.TYPE_CLASS_NUMBER);
+        inFl.setText("9");
+        lay.addView(inAz); lay.addView(inDist); lay.addView(inSize); lay.addView(inFl);
+
+        new AlertDialog.Builder(this).setTitle("+ Добавить дом на генплан").setView(lay)
+                .setPositiveButton("Добавить", (d, w) -> {
+                    try {
+                        double azR = Math.toRadians(Float.parseFloat(inAz.getText().toString().trim()));
+                        float dist = Float.parseFloat(inDist.getText().toString().trim());
+                        String[] sz = inSize.getText().toString().trim().split("\\s+");
+                        float hw = Float.parseFloat(sz[0]) / 2f, hd = (sz.length > 1 ? Float.parseFloat(sz[1]) : 15f) / 2f;
+                        int lv = Math.max(1, Integer.parseInt(inFl.getText().toString().trim()));
+                        float cx = (float) (Math.sin(azR) * dist), cy = (float) (Math.cos(azR) * dist);
+                        float c = (float) Math.cos(azR), s = (float) Math.sin(azR);
+                        float[][] loc = {{-hw, -hd}, {hw, -hd}, {hw, hd}, {-hw, hd}};
+                        List<float[]> pts = new ArrayList<>();
+                        for (float[] p : loc) pts.add(new float[]{cx + p[0] * c + p[1] * s, cy - p[0] * s + p[1] * c});
+                        OsmBuilding b = buildFromPts(pts, lv, lv * 3f, "ДОМ", true);
+                        synchronized (osmBuildings) { customBuildings.add(b); osmBuildings.add(b); }
+                        is2DMapMode = true; btnModeToggle.setText("Камера AR"); overlayView.invalidate();
+                    } catch (Exception ignored) {}
+                }).setNegativeButton("Отмена", null).show();
     }
 
     private void showCloudBimDialog() {
         final EditText in = new EditText(this);
-        in.setHint("Ссылка на модель Autodesk Viewer / APS");
-        in.setText(cloudBimUrl);
+        in.setHint("Ссылка на модель Autodesk Viewer / APS"); in.setText(cloudBimUrl);
         new AlertDialog.Builder(this).setTitle("Облачный BIM (APS / NWD-NWC)").setView(in)
                 .setPositiveButton("Открыть модель", (d, w) -> {
                     cloudBimUrl = in.getText().toString().trim();
                     if (!cloudBimUrl.startsWith("http")) cloudBimUrl = "https://" + cloudBimUrl;
-                    getSharedPreferences("osm_cache_v8", MODE_PRIVATE).edit().putString("bim_url", cloudBimUrl).apply();
+                    getSharedPreferences("osm_cache_v10", MODE_PRIVATE).edit().putString("bim_url", cloudBimUrl).apply();
                     try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(cloudBimUrl))); } catch (Exception ignored) {}
                 }).setNegativeButton("Отмена", null).show();
     }
 
     private void showDefectPhotoDialog() {
         final EditText in = new EditText(this);
-        in.setHint("Оси и замечание (напр: Оси А-Ж, фасад)");
-        in.setText(lastDefectStamp);
+        in.setHint("Оси и замечание (напр: Оси А-Ж, фасад)"); in.setText(lastDefectStamp);
         new AlertDialog.Builder(this).setTitle("Фотофиксация со штампом осей").setView(in)
-                .setPositiveButton("Снять фото AR", (d, w) -> {
-                    lastDefectStamp = in.getText().toString().trim();
-                    captureARPhoto(lastDefectStamp);
-                })
+                .setPositiveButton("Снять фото AR", (d, w) -> { lastDefectStamp = in.getText().toString().trim(); captureARPhoto(lastDefectStamp); })
                 .setNeutralButton("Без текста", (d, w) -> captureARPhoto(""))
                 .setNegativeButton("Отмена", null).show();
     }
@@ -623,9 +801,8 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                         new Thread(() -> {
                             try {
                                 HttpURLConnection c = (HttpURLConnection) new URL("https://nominatim.openstreetmap.org/search?format=json&limit=1&q=" + URLEncoder.encode(q, "UTF-8")).openConnection();
-                                c.setRequestProperty("User-Agent", "BIMSunLevel/3.3");
-                                BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream()));
-                                JSONArray a = new JSONArray(br.readLine()); br.close();
+                                c.setRequestProperty("User-Agent", "BIMSunLevel/3.5");
+                                JSONArray a = new JSONArray(readStreamAll(c.getInputStream()));
                                 if (a.length() > 0) {
                                     JSONObject o = a.getJSONObject(0);
                                     Location l = new Location("nom"); l.setLatitude(o.getDouble("lat")); l.setLongitude(o.getDouble("lon"));
@@ -643,29 +820,32 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             try {
                 InputStream is = getContentResolver().openInputStream(data.getData());
                 if (is == null) return;
-                BufferedReader br = new BufferedReader(new InputStreamReader(is));
-                List<String> lines = new ArrayList<>(); String l;
-                while ((l = br.readLine()) != null) lines.add(l.trim());
-                br.close();
-                List<float[]> pts = new ArrayList<>();
-                Float lx = null;
-                for (int i = 0; i < lines.size(); i++) {
-                    String s = lines.get(i).toUpperCase(Locale.US);
+                String raw = readStreamAll(is);
+                if (raw.trim().startsWith("{") && raw.contains("FeatureCollection")) {
+                    int cnt = parseGeoJsonFile(raw);
+                    Toast.makeText(this, "GeoJSON загружен: " + cnt + " домов", Toast.LENGTH_LONG).show();
+                    is2DMapMode = true; btnModeToggle.setText("Камера AR"); overlayView.invalidate();
+                    return;
+                }
+                String[] lines = raw.split("\\r?\\n");
+                List<float[]> pts = new ArrayList<>(); Float lx = null;
+                for (int i = 0; i < lines.length; i++) {
+                    String s = lines[i].trim().toUpperCase(Locale.US);
                     if (s.contains("IFCCARTESIANPOINT((")) {
                         String[] c = s.substring(s.indexOf("((") + 2, s.indexOf("))")).split(",");
                         if (c.length >= 2) pts.add(new float[]{Float.parseFloat(c[0].trim()), Float.parseFloat(c[1].trim())});
-                    } else if ("10".equals(s) && i + 1 < lines.size()) {
-                        try { lx = Float.parseFloat(lines.get(++i)); } catch (Exception ignored) {}
-                    } else if ("20".equals(s) && lx != null && i + 1 < lines.size()) {
-                        try { pts.add(new float[]{lx, Float.parseFloat(lines.get(++i))}); lx = null; } catch (Exception ignored) {}
+                    } else if ("10".equals(s) && i + 1 < lines.length) {
+                        try { lx = Float.parseFloat(lines[++i].trim()); } catch (Exception ignored) {}
+                    } else if ("20".equals(s) && lx != null && i + 1 < lines.length) {
+                        try { pts.add(new float[]{lx, Float.parseFloat(lines[++i].trim())}); lx = null; } catch (Exception ignored) {}
                     }
                 }
                 if (pts.size() >= 3) {
-                    customPoly.clear(); customPoly.addAll(pts);
-                    if (rawOsmCache != null) parseOsmJson(rawOsmCache, latitude, longitude);
+                    OsmBuilding b = buildFromPts(pts, 8, 24f, "ПРОЕКТ", true);
+                    synchronized (osmBuildings) { customBuildings.add(b); osmBuildings.add(b); }
                     is2DMapMode = true; btnModeToggle.setText("Камера AR"); overlayView.invalidate();
                 }
-            } catch (Exception ignored) {}
+            } catch (Exception e) { Toast.makeText(this, "Ошибка импорта: " + e.getMessage(), Toast.LENGTH_SHORT).show(); }
         }
     }
 
@@ -712,8 +892,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                     latitude, longitude, camAzimuth, getCardinal(camAzimuth), relativeHeightMeters, fl), 40, 86, p);
             c.drawText(String.format(Locale.US, "Уклон: %.2f° | Свет: %.0f лк | КЕО: %.2f%% | СанПиН: %.1f ч (%s)",
                     rawPitch - tarePitch, currentLux, Math.max(0f, lastKeo), ins[1], ins[1] >= 2f ? "НОРМА" : "НАРУШЕНИЕ"), 40, 106, p);
-            if (!lastTapeSummary.isEmpty()) c.drawText("AR-Рулетка (последний замер): " + lastTapeSummary, 40, 126, p);
-
+            if (!lastTapeSummary.isEmpty()) c.drawText("AR-Рулетка: " + lastTapeSummary, 40, 126, p);
             Bitmap bmp = Bitmap.createBitmap(overlayView.getWidth(), overlayView.getHeight(), Bitmap.Config.ARGB_8888);
             Canvas sc = new Canvas(bmp); sc.drawColor(Color.rgb(16, 24, 36)); overlayView.draw(sc);
             c.drawBitmap(bmp, null, new Rect(40, 142, 555, 805), null); bmp.recycle();
@@ -726,17 +905,11 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 new AlertDialog.Builder(this).setTitle("PDF-акт сохранён")
                         .setMessage("Файл: Download/BIM_Reports/" + name + "\nОтправить отчёт в мессенджер или на почту?")
                         .setPositiveButton("Отправить", (d, w) -> {
-                            Intent s = new Intent(Intent.ACTION_SEND);
-                            s.setType("application/pdf");
-                            s.putExtra(Intent.EXTRA_STREAM, shareUri);
-                            s.putExtra(Intent.EXTRA_SUBJECT, "Акт стройконтроля BIM Sun & Level");
-                            s.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                            Intent s = new Intent(Intent.ACTION_SEND); s.setType("application/pdf");
+                            s.putExtra(Intent.EXTRA_STREAM, shareUri); s.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
                             startActivity(Intent.createChooser(s, "Отправить PDF-акт"));
-                        })
-                        .setNegativeButton("Закрыть", null).show();
-            } else {
-                Toast.makeText(this, "PDF сохранен: Download/BIM_Reports/" + name, Toast.LENGTH_LONG).show();
-            }
+                        }).setNegativeButton("Закрыть", null).show();
+            } else Toast.makeText(this, "PDF сохранен: " + name, Toast.LENGTH_LONG).show();
         } catch (Exception e) { Toast.makeText(this, "Ошибка PDF: " + e.getMessage(), Toast.LENGTH_SHORT).show(); }
     }
 
@@ -757,7 +930,9 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         new AlertDialog.Builder(this).setTitle("Этажность дома " + b.houseNumber).setView(in)
                 .setPositiveButton("ОК", (d, w) -> {
                     try { b.levels = Integer.parseInt(in.getText().toString().trim()); b.heightMeters = b.levels * 3f; overlayView.invalidate(); } catch (Exception ignored) {}
-                }).show();
+                })
+                .setNeutralButton("Удалить", (d, w) -> { synchronized (osmBuildings) { osmBuildings.remove(b); customBuildings.remove(b); } overlayView.invalidate(); })
+                .setNegativeButton("Отмена", null).show();
     }
 
     private double[] computeSun(double lat, int day, double hr) {
@@ -852,7 +1027,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         else c.drawColor(Color.rgb(16, 24, 36));
         overlayView.draw(c);
 
-        // Штамп осей, дефекта и компаса на фото
         float ui = w / 1080f;
         Paint sp = new Paint(Paint.ANTI_ALIAS_FLAG);
         sp.setColor(Color.argb(220, 12, 18, 28));
@@ -895,13 +1069,13 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         Location best = null;
         for (String p : new String[]{"fused", LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER}) {
             try {
-                locationManager.requestLocationUpdates(p, 1500L, 0f, locListener);
+                locationManager.requestLocationUpdates(p, 2000L, 0f, locListener);
                 Location l = locationManager.getLastKnownLocation(p);
                 if (l != null && (best == null || l.getTime() > best.getTime())) best = l;
             } catch (Exception ignored) {}
         }
         if (best != null) onNewLocation(best);
-        else if (!realOsmLoaded) fetchOsmBuildings(latitude, longitude);
+        else if (!realOsmLoaded) fetchOsmBuildings(latitude, longitude, false);
     }
 
     private void onNewLocation(Location l) {
@@ -913,7 +1087,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
         if (autoGroundPressure < 0 || mvSq > 2500.0) fetchAutoGroundMeteo(latitude, longitude);
         recalcHeight();
         double osmSq = Math.pow((latitude - lastOsmLat) * 111132.0, 2) + Math.pow((longitude - lastOsmLon) * 65000.0, 2);
-        if (!realOsmLoaded || osmSq > 1600.0 || mvSq > 1600.0) fetchOsmBuildings(latitude, longitude);
+        if (!realOsmLoaded || osmSq > 1600.0 || mvSq > 1600.0) fetchOsmBuildings(latitude, longitude, mvSq > 1600.0);
         if (overlayView != null) overlayView.postInvalidate();
     }
 
@@ -953,9 +1127,7 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 wasLevel = true;
                 if (overlayView != null) overlayView.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
                 if (toneGen != null) try { toneGen.startTone(ToneGenerator.TONE_PROP_BEEP, 65); } catch (Exception ignored) {}
-            } else if (cp > 1.2f || cr > 1.2f) {
-                wasLevel = false;
-            }
+            } else if (cp > 1.2f || cr > 1.2f) wasLevel = false;
             if (!hasRotVec && hasMag && SensorManager.getRotationMatrix(rotMat, null, lastAcc, lastMag)) applyRot();
         } else if (t == Sensor.TYPE_MAGNETIC_FIELD) {
             System.arraycopy(e.values, 0, lastMag, 0, 3); hasMag = true;
@@ -1005,25 +1177,21 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             if (is2DMapMode) {
                 c.drawColor(isLightTheme ? Color.rgb(238, 242, 247) : Color.rgb(14, 22, 34));
                 draw2D(c, w, h, ui, sun);
-            } else {
-                drawAR(c, w, h, ui, sun);
-            }
+            } else drawAR(c, w, h, ui, sun);
             drawQuickFloorButtons(c, w, ui);
             if (showKeoHeatmap) drawKeoMap(c, ui);
             drawHeader(c, w, ui, sun);
         }
 
         private void drawQuickFloorButtons(Canvas c, int w, float ui) {
-            paint.setStyle(Paint.Style.FILL);
-            paint.setColor(Color.argb(200, 30, 55, 85));
+            paint.setStyle(Paint.Style.FILL); paint.setColor(Color.argb(200, 30, 55, 85));
             c.drawRoundRect(new RectF(w - 145 * ui, 555 * ui, w - 22 * ui, 635 * ui), 14 * ui, 14 * ui, paint);
             c.drawRoundRect(new RectF(w - 145 * ui, 645 * ui, w - 22 * ui, 725 * ui), 14 * ui, 14 * ui, paint);
             paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(2 * ui); paint.setColor(Color.rgb(110, 210, 255));
             c.drawRoundRect(new RectF(w - 145 * ui, 555 * ui, w - 22 * ui, 635 * ui), 14 * ui, 14 * ui, paint);
             c.drawRoundRect(new RectF(w - 145 * ui, 645 * ui, w - 22 * ui, 725 * ui), 14 * ui, 14 * ui, paint);
             paint.setStyle(Paint.Style.FILL); paint.setColor(Color.WHITE); paint.setTextSize(23 * ui);
-            c.drawText("▲ Эт", w - 118 * ui, 604 * ui, paint);
-            c.drawText("▼ Эт", w - 118 * ui, 694 * ui, paint);
+            c.drawText("▲ Эт", w - 118 * ui, 604 * ui, paint); c.drawText("▼ Эт", w - 118 * ui, 694 * ui, paint);
         }
 
         private void draw2D(Canvas c, int w, int h, float ui, double[] sun) {
@@ -1096,7 +1264,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 }
             }
 
-            // Горизонт и шкала компаса AR
             float hy = cy + (camAltitude / fV) * h;
             paint.setColor(Color.argb(180, 0, 255, 180)); c.drawLine(0, hy, w, hy, paint);
             String[] dirs = {"С (0°)", "СВ", "В (90°)", "ЮВ", "Ю (180°)", "ЮЗ", "З (270°)", "СЗ"};
@@ -1106,7 +1273,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                 if (dx >= -40 && dx <= w + 40) { c.drawCircle(dx, hy, 6 * ui, paint); c.drawText(dirs[i], dx - 30 * ui, hy - 14 * ui, paint); }
             }
 
-            // Дуга солнца
             path.reset(); boolean st = false; paint.setStyle(Paint.Style.STROKE); paint.setColor(Color.YELLOW); paint.setStrokeWidth(5f * ui);
             for (double hr = 5.0; hr <= 21.0; hr += 0.5) {
                 double[] p = computeSun(latitude, selectedDay, hr); if (p[1] < -5) continue;
@@ -1115,10 +1281,8 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             }
             c.drawPath(path, paint);
 
-            // Мини-радар / Компас в правом верхнем углу AR
             drawMiniRadar(c, w, ui, sun[0]);
 
-            // Пузырьковый уровень
             float r = 85f * ui, calP = rawPitch - tarePitch, calR = rawRoll - tareRoll;
             boolean ok = Math.abs(calP) < 0.5f && Math.abs(calR) < 0.5f;
             paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(3.5f * ui);
@@ -1159,7 +1323,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(2.5f * ui); paint.setColor(Color.rgb(0, 230, 180));
             c.drawCircle(rx, ry, rad, paint);
 
-            // Точки домов OSM на радаре
             paint.setStyle(Paint.Style.FILL); paint.setColor(Color.argb(170, 120, 195, 255));
             double rotR = Math.toRadians(-camAzimuth);
             synchronized (osmBuildings) {
@@ -1172,7 +1335,6 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
                     }
                 }
             }
-            // Вращающаяся метка Севера (N) и точка Солнца
             double nR = Math.toRadians(-camAzimuth - 90.0), sR = Math.toRadians(sunAz - camAzimuth - 90.0);
             paint.setColor(Color.rgb(255, 75, 75)); paint.setTextSize(20 * ui);
             c.drawText("N", rx + (float) Math.cos(nR) * (rad - 15 * ui) - 7 * ui, ry + (float) Math.sin(nR) * (rad - 15 * ui) + 7 * ui, paint);
@@ -1219,11 +1381,11 @@ public class MainActivity extends Activity implements SensorEventListener, Surfa
             paint.setColor(ins[1] >= 2f ? Color.rgb(0, 175, 85) : Color.rgb(225, 55, 55));
             c.drawText(String.format(Locale.US, "СанПиН: %s (%.1f ч без тени / %.1f ч)", ins[1] >= 2f ? "СОБЛЮДЕНА (≥2ч)" : "НАРУШЕНИЕ (<2ч)", ins[1], ins[0]), 34 * ui, 254 * ui, paint);
 
-            paint.setTextSize(22.5f * ui); paint.setColor(gpsLocked ? Color.rgb(0, 160, 80) : Color.rgb(220, 130, 20));
+            paint.setTextSize(22f * ui); paint.setColor(realOsmLoaded ? Color.rgb(0, 170, 85) : Color.rgb(245, 145, 35));
             c.drawText(String.format(Locale.US, "%.4f N, %.4f E [%s] | %s", latitude, longitude, gpsLocked ? "GPS ОК" : "Поиск GPS", osmStatus), 34 * ui, 300 * ui, paint);
             paint.setColor(isLightTheme ? Color.DKGRAY : Color.rgb(150, 205, 255));
             c.drawText(seasonLabel + " | Кнопки справа ▲/▼ = быстрая смена этажа", 34 * ui, 340 * ui, paint);
-            c.drawText("Фото = штамп осей | Акт PDF = сохранение + отправка", 34 * ui, 372 * ui, paint);
+            c.drawText("Тап по шапке = обновить | Меню BIM = +Дом / GeoJSON", 34 * ui, 372 * ui, paint);
         }
 
         private float azToX(float az, int w, float fH) {
